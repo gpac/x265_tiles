@@ -319,10 +319,14 @@ void CUData::initCTU(const Frame& frame, uint32_t cuAddr, int qp, uint32_t first
     m_vbvAffected = false;
 
     uint32_t widthInCU = m_slice->m_sps->numCuInWidth;
-    m_cuLeft = (m_cuAddr % widthInCU) ? m_encData->getPicCTU(m_cuAddr - 1) : NULL;
-    m_cuAbove = (m_cuAddr >= widthInCU) && !m_bFirstRowInSlice ? m_encData->getPicCTU(m_cuAddr - widthInCU) : NULL;
+    uint32_t col = m_cuAddr % widthInCU;
+    uint32_t row = m_cuAddr / widthInCU;
+    TileLayout tiles(*m_slice->m_sps, *m_slice->m_pps);
+    uint32_t tileId = tiles.id(col, row);
+    m_cuLeft = col && tiles.id(col - 1, row) == tileId ? m_encData->getPicCTU(m_cuAddr - 1) : NULL;
+    m_cuAbove = row && !m_bFirstRowInSlice && tiles.id(col, row - 1) == tileId ? m_encData->getPicCTU(m_cuAddr - widthInCU) : NULL;
     m_cuAboveLeft = (m_cuLeft && m_cuAbove) ? m_encData->getPicCTU(m_cuAddr - widthInCU - 1) : NULL;
-    m_cuAboveRight = (m_cuAbove && ((m_cuAddr % widthInCU) < (widthInCU - 1))) ? m_encData->getPicCTU(m_cuAddr - widthInCU + 1) : NULL;
+    m_cuAboveRight = m_cuAbove && col + 1 < widthInCU && tiles.id(col + 1, row - 1) == tileId ? m_encData->getPicCTU(m_cuAddr - widthInCU + 1) : NULL;
     memset(m_distortion, 0, m_numPartitions * sizeof(sse_t));
 }
 
@@ -898,6 +902,22 @@ int8_t CUData::getLastCodedQP(uint32_t absPartIdx) const
     {
         if (m_absIdxInCTU)
             return m_encData->getPicCTU(m_cuAddr)->getLastCodedQP(m_absIdxInCTU);
+        else if (m_slice->m_pps->tileColumns > 1 || m_slice->m_pps->tileRows > 1)
+        {
+            TileLayout tiles(*m_slice->m_sps, *m_slice->m_pps);
+            uint32_t col = m_cuAddr % tiles.width;
+            uint32_t row = m_cuAddr / tiles.width;
+            uint32_t tileCol = tiles.column(col);
+            uint32_t tileRow = tiles.row(row);
+            uint32_t firstCol = tiles.columnStart(tileCol);
+            uint32_t firstRow = tiles.sliceRowStart(tileRow, tiles.sliceBand(row));
+            if (col == firstCol && (row == firstRow || m_slice->m_pps->bEntropyCodingSyncEnabled))
+                return (int8_t)m_slice->m_sliceQp;
+            uint32_t prevAddr = col == firstCol ?
+                (row - 1) * tiles.width + tiles.columnStart(tileCol + 1) - 1 :
+                m_cuAddr - 1;
+            return m_encData->getPicCTU(prevAddr)->getLastCodedQP(m_encData->m_param->num4x4Partitions);
+        }
         else if (m_cuAddr > 0 && !(m_slice->m_pps->bEntropyCodingSyncEnabled && !(m_cuAddr % m_slice->m_sps->numCuInWidth)))
             return m_encData->getPicCTU(m_cuAddr - 1)->getLastCodedQP(m_encData->m_param->num4x4Partitions);
         else
@@ -1474,13 +1494,25 @@ bool CUData::hasEqualMotion(uint32_t absPartIdx, const CUData& candCU, uint32_t 
     return true;
 }
 
+bool CUData::restrictMctsTemporalMvp() const
+{
+    if (!m_slice->m_param->bEnableMcts || !m_slice->m_bTemporalMvp)
+        return false;
+    // At a tile's right edge the extracted picture may derive a different temporal candidate.
+    TileLayout tiles(*m_slice->m_sps, *m_slice->m_pps);
+    uint32_t col = m_cuAddr % tiles.width;
+    return col + 1 == tiles.columnStart(tiles.column(col) + 1);
+}
+
 /* Construct list of merging candidates, returns count */
-uint32_t CUData::getInterMergeCandidates(uint32_t absPartIdx, uint32_t puIdx, MVField(*candMvField)[2], uint8_t* candDir) const
+uint32_t CUData::getInterMergeCandidates(uint32_t absPartIdx, uint32_t puIdx, MVField(*candMvField)[2], uint8_t* candDir, uint32_t* spatialCount) const
 {
     uint32_t absPartAddr = m_absIdxInCTU + absPartIdx;
     const bool isInterB = m_slice->isInterB();
 
     const uint32_t maxNumMergeCand = m_slice->m_maxNumMergeCand;
+    if (spatialCount)
+        *spatialCount = maxNumMergeCand;
 
     for (uint32_t i = 0; i < maxNumMergeCand; ++i)
     {
@@ -1611,6 +1643,9 @@ uint32_t CUData::getInterMergeCandidates(uint32_t absPartIdx, uint32_t puIdx, MV
                 return maxNumMergeCand;
         }
     }
+    // Keep the decoder's complete candidate list, but only select spatial entries.
+    if (spatialCount && restrictMctsTemporalMvp())
+        *spatialCount = count;
 #if ENABLE_SCC_EXT
     if (m_slice->m_bTemporalMvp)
 #else
@@ -1800,11 +1835,13 @@ bool CUData::getMedianColMV(const CUData* colCU, const Frame* colPic, int list, 
 
 // Create the PMV list. Called for each reference index.
 #if (ENABLE_MULTIVIEW || ENABLE_SCC_EXT)
-int CUData::getPMV(InterNeighbourMV* neighbours, uint32_t picList, uint32_t refIdx, MV* amvpCand, MV* pmv, uint32_t puIdx, uint32_t absPartIdx) const
+int CUData::getPMV(InterNeighbourMV* neighbours, uint32_t picList, uint32_t refIdx, MV* amvpCand, MV* pmv, uint32_t puIdx, uint32_t absPartIdx, int* safeMvpIdx) const
 #else
-int CUData::getPMV(InterNeighbourMV* neighbours, uint32_t picList, uint32_t refIdx, MV* amvpCand, MV* pmv) const
+int CUData::getPMV(InterNeighbourMV* neighbours, uint32_t picList, uint32_t refIdx, MV* amvpCand, MV* pmv, int* safeMvpIdx) const
 #endif
 {
+    if (safeMvpIdx)
+        *safeMvpIdx = -1;
     MV directMV[MD_ABOVE_LEFT + 1];
     MV indirectMV[MD_ABOVE_LEFT + 1];
     bool validDirect[MD_ABOVE_LEFT + 1];
@@ -1957,6 +1994,8 @@ int CUData::getPMV(InterNeighbourMV* neighbours, uint32_t picList, uint32_t refI
     {
         if (m_slice->m_sps->bTemporalMVPEnabled && num < 2)
         {
+            if (safeMvpIdx && restrictMctsTemporalMvp())
+                *safeMvpIdx = num ? 0 : 1;
             int tempRefIdx = neighbours[MD_COLLOCATED].refIdx[picList];
             if (tempRefIdx != -1)
             {

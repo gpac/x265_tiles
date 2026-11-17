@@ -3322,7 +3322,8 @@ void Analysis::checkMerge2Nx2N_rd0_4(Mode& skip, Mode& merge, const CUGeom& cuGe
 
     MVField candMvField[MRG_MAX_NUM_CANDS][2]; // double length for mv of both lists
     uint8_t candDir[MRG_MAX_NUM_CANDS];
-    uint32_t numMergeCand = tempPred->cu.getInterMergeCandidates(0, 0, candMvField, candDir);
+    uint32_t spatialCount;
+    uint32_t numMergeCand = tempPred->cu.getInterMergeCandidates(0, 0, candMvField, candDir, &spatialCount);
     PredictionUnit pu(merge.cu, cuGeom, 0);
 
     bestPred->sa8dCost = MAX_INT64;
@@ -3334,8 +3335,11 @@ void Analysis::checkMerge2Nx2N_rd0_4(Mode& skip, Mode& merge, const CUGeom& cuGe
         safeX = m_slice->m_refFrameList[0][0]->m_encData->m_pir.pirEndCol * m_param->maxCUSize - 3;
         maxSafeMv = (safeX - tempPred->cu.m_cuPelX) * 4;
     }
-    for (uint32_t i = 0; i < numMergeCand; ++i)
+    for (uint32_t i = 0; i < numMergeCand && i < spatialCount; ++i)
     {
+        if (((candDir[i] & 1) && !isMctsMvValid(tempPred->cu, pu, candMvField[i][0].mv)) ||
+            ((candDir[i] & 2) && !isMctsMvValid(tempPred->cu, pu, candMvField[i][1].mv)))
+            continue;
         if (m_bFrameParallel)
         {
             // Parallel slices bound check
@@ -3457,7 +3461,8 @@ void Analysis::checkMerge2Nx2N_rd5_6(Mode& skip, Mode& merge, const CUGeom& cuGe
 
     MVField candMvField[MRG_MAX_NUM_CANDS][2]; // double length for mv of both lists
     uint8_t candDir[MRG_MAX_NUM_CANDS];
-    uint32_t numMergeCand = merge.cu.getInterMergeCandidates(0, 0, candMvField, candDir);
+    uint32_t spatialCount;
+    uint32_t numMergeCand = merge.cu.getInterMergeCandidates(0, 0, candMvField, candDir, &spatialCount);
 #if ENABLE_SCC_EXT
     restrictBipredMergeCand(&merge.cu, 0, candMvField, candDir, numMergeCand);
 #endif
@@ -3474,8 +3479,11 @@ void Analysis::checkMerge2Nx2N_rd5_6(Mode& skip, Mode& merge, const CUGeom& cuGe
         safeX = m_slice->m_refFrameList[0][0]->m_encData->m_pir.pirEndCol * m_param->maxCUSize - 3;
         maxSafeMv = (safeX - tempPred->cu.m_cuPelX) * 4;
     }
-    for (uint32_t i = 0; i < numMergeCand; i++)
+    for (uint32_t i = 0; i < numMergeCand && i < spatialCount; i++)
     {
+        if (((candDir[i] & 1) && !isMctsMvValid(tempPred->cu, pu, candMvField[i][0].mv)) ||
+            ((candDir[i] & 2) && !isMctsMvValid(tempPred->cu, pu, candMvField[i][1].mv)))
+            continue;
         if (m_bFrameParallel)
         {
             // Parallel slices bound check
@@ -3924,8 +3932,8 @@ void Analysis::checkBidir2Nx2N(Mode& inter2Nx2N, Mode& bidir2Nx2N, const CUGeom&
         uint32_t zcost = zsa8d + m_rdCost.getCost(bits0) + m_rdCost.getCost(bits1);
 
         /* refine MVP selection for zero mv, updates: mvp, mvpidx, bits, cost */
-        mvp0 = checkBestMVP(inter2Nx2N.amvpCand[0][ref0], mvzero, mvpIdx0, bits0, zcost);
-        mvp1 = checkBestMVP(inter2Nx2N.amvpCand[1][ref1], mvzero, mvpIdx1, bits1, zcost);
+        mvp0 = checkBestMVP(inter2Nx2N.amvpCand[0][ref0], mvzero, mvpIdx0, bits0, zcost, m_param->bEnableMcts ? inter2Nx2N.safeMvpIdx[0][ref0] : -1);
+        mvp1 = checkBestMVP(inter2Nx2N.amvpCand[1][ref1], mvzero, mvpIdx1, bits1, zcost, m_param->bEnableMcts ? inter2Nx2N.safeMvpIdx[1][ref1] : -1);
 
         uint32_t zbits = bits0 + bits1 + m_listSelBits[2] - (m_listSelBits[0] + m_listSelBits[1]);
         zcost = zsa8d + m_rdCost.getCost(zbits);

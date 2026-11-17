@@ -667,8 +667,23 @@ void Entropy::codePPS( const PPS& pps, bool filerAcross, int iPPSInitQpMinus26, 
     WRITE_FLAG(layer ? 0 : pps.bUseWeightPred,            "weighted_pred_flag");
     WRITE_FLAG(layer ? 0 : pps.bUseWeightedBiPred,        "weighted_bipred_flag");
     WRITE_FLAG(pps.bTransquantBypassEnabled,  "transquant_bypass_enable_flag");
-    WRITE_FLAG(0,                             "tiles_enabled_flag");
+    bool tilesEnabled = pps.tileColumns > 1 || pps.tileRows > 1;
+    WRITE_FLAG(tilesEnabled,                  "tiles_enabled_flag");
     WRITE_FLAG(pps.bEntropyCodingSyncEnabled, "entropy_coding_sync_enabled_flag");
+    if (tilesEnabled)
+    {
+        WRITE_UVLC(pps.tileColumns - 1, "num_tile_columns_minus1");
+        WRITE_UVLC(pps.tileRows - 1, "num_tile_rows_minus1");
+        WRITE_FLAG(pps.bUniformTileSpacing, "uniform_spacing_flag");
+        if (!pps.bUniformTileSpacing)
+        {
+            for (uint32_t i = 0; i + 1 < pps.tileColumns; i++)
+                WRITE_UVLC(pps.tileColumnBoundary[i + 1] - pps.tileColumnBoundary[i] - 1, "column_width_minus1");
+            for (uint32_t i = 0; i + 1 < pps.tileRows; i++)
+                WRITE_UVLC(pps.tileRowBoundary[i + 1] - pps.tileRowBoundary[i] - 1, "row_height_minus1");
+        }
+        WRITE_FLAG(pps.bLoopFilterAcrossTiles, "loop_filter_across_tiles_enabled_flag");
+    }
     WRITE_FLAG(filerAcross,                   "loop_filter_across_slices_enabled_flag");
 
     WRITE_FLAG(pps.bDeblockingFilterControlPresent, "deblocking_filter_control_present_flag");
@@ -753,7 +768,7 @@ void Entropy::codeProfileTier(const ProfileTierLevel& ptl, int maxTempSubLayers,
         WRITE_FLAG(ptl.intraConstraintFlag,        "general_intra_constraint_flag");
         WRITE_FLAG(ptl.onePictureOnlyConstraintFlag,"general_one_picture_only_constraint_flag");
         WRITE_FLAG(ptl.lowerBitRateConstraintFlag, "general_lower_bit_rate_constraint_flag");
-        if (ptl.profileIdc[layer] == Profile::MAINSCC)
+        if (ptl.profileIdc[layer] == Profile::MAINSCC || ptl.profileIdc[layer] == Profile::HIGHTHROUGHPUTREXT)
         {
             WRITE_FLAG(bitDepthConstraint <= 14, "max_14bit_constraint_flag");
             WRITE_CODE(0, 16, "reserved_zero_33bits[0..15]");
@@ -773,7 +788,7 @@ void Entropy::codeProfileTier(const ProfileTierLevel& ptl, int maxTempSubLayers,
         WRITE_CODE(0, 16, "XXX_reserved_zero_44bits[16..31]");
         WRITE_CODE(0, 12, "XXX_reserved_zero_44bits[32..43]");
     }
-    if (ptl.profileIdc[layer] == Profile::MAINSCC)
+    if (ptl.profileIdc[layer] == Profile::MAINSCC || ptl.profileIdc[layer] == Profile::HIGHTHROUGHPUTREXT)
         WRITE_FLAG(false, "inbld_flag");
 
     WRITE_CODE(ptl.levelIdc, 8, "general_level_idc");
@@ -1106,7 +1121,7 @@ void Entropy::codeSliceHeader(const Slice& slice, FrameData& encData, uint32_t s
     // TODO: Enable when pps_loop_filter_across_slices_enabled_flag==1
     //       We didn't support filter across slice board, so disable it now
 
-    if (encData.m_param->maxSlices <= 1)
+    if (encData.m_param->maxSlices <= 1 && !encData.m_param->bTileSlices && !encData.m_param->bEnableMcts)
     {
         bool isSAOEnabled = slice.m_sps->bUseSAO && slice.m_bUseSao ? saoParam->bSaoFlag[0] || saoParam->bSaoFlag[1] : false;
         bool isDBFEnabled = !slice.m_pps->bPicDisableDeblockingFilter;

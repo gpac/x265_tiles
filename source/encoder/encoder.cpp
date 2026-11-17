@@ -252,6 +252,12 @@ void Encoder::create()
     // Do not allow WPP if only one row or fewer than 3 columns, it is pointless and unstable
     if (rows == 1 || cols < 3)
     {
+        if (p->bEnableWavefront && (p->tileColumns > 1 || p->tileRows > 1))
+        {
+            x265_log(p, X265_LOG_ERROR, "tiles with WPP require multiple CTU rows and at least three CTU columns\n");
+            m_aborted = true;
+            return;
+        }
         x265_log(p, X265_LOG_WARNING, "Too few rows/columns, --wpp disabled\n");
         p->bEnableWavefront = 0;
     }
@@ -283,6 +289,12 @@ void Encoder::create()
 
     if (!m_numPools)
     {
+        if (p->bEnableWavefront && (p->tileColumns > 1 || p->tileRows > 1))
+        {
+            x265_log(p, X265_LOG_ERROR, "tiles with WPP require a thread pool\n");
+            m_aborted = true;
+            return;
+        }
         // issue warnings if any of these features were requested
         if (p->bEnableWavefront)
             x265_log(p, X265_LOG_WARNING, "No thread pool allocated, --wpp disabled\n");
@@ -300,7 +312,8 @@ void Encoder::create()
         p->bThreadedME = 0;
     }
 
-    x265_log(p, X265_LOG_INFO, "Slices                              : %d\n", p->maxSlices);
+    int totalSlices = p->bTileSlices ? p->tileColumns * p->tileRows * p->slicesPerTile : p->maxSlices;
+    x265_log(p, X265_LOG_INFO, "Slices                              : %d\n", totalSlices);
 
     char buf[128];
     int len = 0;
@@ -1989,7 +2002,14 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
          * encoding the frame.  This is how back-pressure through the API is
          * accomplished when the encoder is full */
         if (!m_bZeroLatency || pass)
+        {
             outFrames = curEncoder->getEncodedPicture(m_nalList);
+            if (m_nalList.m_failed)
+            {
+                m_aborted = true;
+                return -1;
+            }
+        }
         if (outFrames)
         {
             for (int sLayer = 0; sLayer < m_param->numLayers; sLayer++)
@@ -3420,7 +3440,7 @@ void Encoder::getStreamHeaders(NALList& list, Entropy& sbacCoder, Bitstream& bs)
     for (int layer = 0; layer < m_param->numLayers; layer++)
     {
         bs.resetBits();
-        sbacCoder.codePPS(m_pps, (m_param->maxSlices <= 1), m_iPPSQpMinus26, layer);
+        sbacCoder.codePPS(m_pps, (m_param->maxSlices <= 1 && !m_param->bTileSlices && !m_param->bEnableMcts), m_iPPSQpMinus26, layer);
         bs.writeByteAlignment();
         list.serialize(NAL_UNIT_PPS, bs, layer);
     }
@@ -3733,6 +3753,23 @@ void Encoder::initSPS(SPS *sps)
 
 void Encoder::initPPS(PPS *pps)
 {
+    pps->tileColumns = m_param->tileColumns;
+    pps->tileRows = m_param->tileRows;
+    pps->slicesPerTile = m_param->slicesPerTile;
+    pps->bLoopFilterAcrossTiles = m_param->bLoopFilterAcrossTiles;
+    pps->bUniformTileSpacing = !m_param->tileColumnWidthCount && !m_param->tileRowHeightCount;
+    uint32_t widthInCtu = (m_param->sourceWidth + m_param->maxCUSize - 1) / m_param->maxCUSize;
+    uint32_t heightInCtu = (m_param->sourceHeight + m_param->maxCUSize - 1) / m_param->maxCUSize;
+    pps->tileColumnBoundary[0] = 0;
+    pps->tileRowBoundary[0] = 0;
+    for (uint32_t i = 0; i < pps->tileColumns; i++)
+        pps->tileColumnBoundary[i + 1] = m_param->tileColumnWidthCount ?
+            pps->tileColumnBoundary[i] + m_param->tileColumnWidths[i] / m_param->maxCUSize :
+            (i + 1) * widthInCtu / pps->tileColumns;
+    for (uint32_t i = 0; i < pps->tileRows; i++)
+        pps->tileRowBoundary[i + 1] = m_param->tileRowHeightCount ?
+            pps->tileRowBoundary[i] + m_param->tileRowHeights[i] / m_param->maxCUSize :
+            (i + 1) * heightInCtu / pps->tileRows;
     bool bIsVbv = m_param->rc.vbvBufferSize > 0 && m_param->rc.vbvMaxBitrate > 0;
     bool bEnableDistOffset = m_param->analysisMultiPassDistortion && m_param->rc.bStatRead;
 
@@ -4654,7 +4691,7 @@ void Encoder::configure(x265_param *p)
         p->maxSlices = 1;
     }
     const uint32_t numRows = (p->sourceHeight + p->maxCUSize - 1) / p->maxCUSize;
-    const uint32_t slicesLimit = X265_MIN(numRows, NALList::MAX_NAL_UNITS - 1);
+    const uint32_t slicesLimit = X265_MIN(numRows, NALList::MAX_LEGACY_NAL_UNITS - 1);
     if (p->maxSlices > slicesLimit)
     {
         x265_log(p, X265_LOG_WARNING, "maxSlices can not be more than min(rows, MAX_NAL_UNITS-1), force set to %d\n", slicesLimit);

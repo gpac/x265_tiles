@@ -103,6 +103,12 @@ namespace X265_NS {
         H0("-F/--frame-threads <integer>     Number of concurrently encoded frames. 0: auto-determined by core count\n");
         H0("   --[no-]wpp                    Enable Wavefront Parallel Processing. Default %s\n", OPT(param->bEnableWavefront));
         H0("   --[no-]slices <integer>       Enable Multiple Slices feature. Default %d\n", param->maxSlices);
+        H0("   --tile-columns <integer|list> Uniform column count or comma-separated widths in luma pixels. Default %d\n", param->tileColumns);
+        H0("   --tile-rows <integer|list>    Uniform row count or comma-separated heights in luma pixels. Default %d\n", param->tileRows);
+        H0("   --slices-per-tile <integer>   Number of independent row-band slices in each tile. Default 1\n");
+        H0("   --[no-]tile-slices            Encode each tile as a separate slice. Default %s\n", OPT(param->bTileSlices));
+        H0("   --[no-]mcts                   Constrain motion within each tile; enables tile slices. Default %s\n", OPT(param->bEnableMcts));
+        H0("   --[no-]loop-filter-across-tiles  Filter across tile boundaries. Default enabled except with MCTS\n");
         H0("   --[no-]pmode                  Parallel mode analysis. Deprecated from release 4.1. Default %s\n", OPT(param->bDistributeModeAnalysis));
         H0("   --[no-]pme                    Parallel motion estimation. Deprecated from release 4.1. Default %s\n", OPT(param->bDistributeMotionEstimation));
         H0("   --[no-]threaded-me            Enables standalone multi-threaded module for motion estimation at CTU level. Default %s\n", OPT(param->bThreadedME));
@@ -855,6 +861,13 @@ namespace X265_NS {
                 }
 #undef OPT
             }
+        }
+
+        const char* svtTileError = x265_svt_tile_error(param);
+        if (svtTileError)
+        {
+            x265_log(param, X265_LOG_ERROR, "%s\n", svtTileError);
+            return true;
         }
 
 #if !ENABLE_MULTIVIEW

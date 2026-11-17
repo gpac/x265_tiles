@@ -2233,6 +2233,119 @@ sse_t Search::estIntraPredChromaQT(Mode &intraMode, const CUGeom& cuGeom)
     return totalDistortion;
 }
 
+bool Search::isMctsMvValid(const CUData& cu, const PredictionUnit& pu, const MV& mv) const
+{
+    if (!m_param->bEnableMcts)
+        return true;
+
+    TileLayout tiles(*m_slice->m_sps, *m_slice->m_pps);
+    uint32_t col = cu.m_cuAddr % tiles.width;
+    uint32_t row = cu.m_cuAddr / tiles.width;
+    int tileCol = tiles.column(col);
+    int tileRow = tiles.row(row);
+    int left = tiles.columnStart(tileCol) * m_param->maxCUSize;
+    int right = tiles.columnStart(tileCol + 1) * m_param->maxCUSize;
+    int top = tiles.rowStart(tileRow) * m_param->maxCUSize;
+    int bottom = tiles.rowStart(tileRow + 1) * m_param->maxCUSize;
+    int x = cu.m_cuPelX + g_zscanToPelX[pu.puAbsPartIdx];
+    int y = cu.m_cuPelY + g_zscanToPelY[pu.puAbsPartIdx];
+    bool standalone = tiles.columns == 1 && tiles.rows == 1;
+    if (standalone)
+    {
+        right = m_slice->m_sps->picWidthInLumaSamples;
+        bottom = m_slice->m_sps->picHeightInLumaSamples;
+    }
+
+    int refLeft = x + (mv.x >> 2) - ((mv.x & 3) ? 3 : 0);
+    int refRight = x + pu.width + (mv.x >> 2) + ((mv.x & 3) ? 4 : 0);
+    int refTop = y + (mv.y >> 2) - ((mv.y & 3) ? 3 : 0);
+    int refBottom = y + pu.height + (mv.y >> 2) + ((mv.y & 3) ? 4 : 0);
+    if (((standalone || tileCol) && refLeft < left) || ((standalone || tileCol + 1 < (int)tiles.columns) && refRight > right) ||
+        ((standalone || tileRow) && refTop < top) || ((standalone || tileRow + 1 < (int)tiles.rows) && refBottom > bottom))
+        return false;
+
+    if (m_csp != X265_CSP_I400)
+    {
+        int hShift = m_hChromaShift;
+        int vShift = m_vChromaShift;
+        int xFracMask = (4 << hShift) - 1;
+        int yFracMask = (4 << vShift) - 1;
+        int cLeft = (x >> hShift) + (mv.x >> (2 + hShift)) - ((mv.x & xFracMask) ? 1 : 0);
+        int cRight = ((x + pu.width) >> hShift) + (mv.x >> (2 + hShift)) + ((mv.x & xFracMask) ? 2 : 0);
+        int cTop = (y >> vShift) + (mv.y >> (2 + vShift)) - ((mv.y & yFracMask) ? 1 : 0);
+        int cBottom = ((y + pu.height) >> vShift) + (mv.y >> (2 + vShift)) + ((mv.y & yFracMask) ? 2 : 0);
+        if (((standalone || tileCol) && cLeft < (left >> hShift)) ||
+            ((standalone || tileCol + 1 < (int)tiles.columns) && cRight > (right >> hShift)) ||
+            ((standalone || tileRow) && cTop < (top >> vShift)) ||
+            ((standalone || tileRow + 1 < (int)tiles.rows) && cBottom > (bottom >> vShift)))
+            return false;
+    }
+    return true;
+}
+
+int Search::constrainMctsMotion(const CUData& cu, const PredictionUnit& pu, ReferencePlanes* ref,
+                                const MV& mvmin, const MV& mvmax, MV& mv)
+{
+    TileLayout tiles(*m_slice->m_sps, *m_slice->m_pps);
+    int col = tiles.column(cu.m_cuAddr % tiles.width);
+    int row = tiles.row(cu.m_cuAddr / tiles.width);
+    int x = cu.m_cuPelX + g_zscanToPelX[pu.puAbsPartIdx];
+    int y = cu.m_cuPelY + g_zscanToPelY[pu.puAbsPartIdx];
+    int left = tiles.columnStart(col) * m_param->maxCUSize;
+    int right = tiles.columnStart(col + 1) * m_param->maxCUSize;
+    int top = tiles.rowStart(row) * m_param->maxCUSize;
+    int bottom = tiles.rowStart(row + 1) * m_param->maxCUSize;
+    bool standalone = tiles.columns == 1 && tiles.rows == 1;
+    if (standalone)
+    {
+        right = m_slice->m_sps->picWidthInLumaSamples;
+        bottom = m_slice->m_sps->picHeightInLumaSamples;
+    }
+    MV lower = mvmin.toQPel(), upper = mvmax.toQPel();
+    if (standalone || col)
+        lower.x = X265_MAX(lower.x, (left - x) * 4);
+    if (standalone || col + 1 < (int)tiles.columns)
+        upper.x = X265_MIN(upper.x, (right - x - pu.width) * 4);
+    if (standalone || row)
+        lower.y = X265_MAX(lower.y, (top - y) * 4);
+    if (standalone || row + 1 < (int)tiles.rows)
+        upper.y = X265_MIN(upper.y, (bottom - y - pu.height) * 4);
+    lower.x = X265_MIN(lower.x, 0);
+    lower.y = X265_MIN(lower.y, 0);
+    upper.x = X265_MAX(upper.x, 0);
+    upper.y = X265_MAX(upper.y, 0);
+
+    mv = mv.clipped(lower, upper);
+    int xAlign = 4 << (m_csp == X265_CSP_I400 ? 0 : m_hChromaShift);
+    int yAlign = 4 << (m_csp == X265_CSP_I400 ? 0 : m_vChromaShift);
+    mv.x = mv.x / xAlign * xAlign;
+    mv.y = mv.y / yAlign * yAlign;
+    int bestCost = m_me.subpelCompare(ref, mv, primitives.pu[m_me.partEnum].satd) + m_me.mvcost(mv);
+    MV zero(0, 0);
+    int zeroCost = m_me.subpelCompare(ref, zero, primitives.pu[m_me.partEnum].satd) + m_me.mvcost(zero);
+    if (zeroCost < bestCost)
+    {
+        mv = zero;
+        bestCost = zeroCost;
+    }
+    const MV directions[] = { MV(-4, 0), MV(4, 0), MV(0, -4), MV(0, 4),
+                              MV(-2, 0), MV(2, 0), MV(0, -2), MV(0, 2),
+                              MV(-1, 0), MV(1, 0), MV(0, -1), MV(0, 1) };
+    for (unsigned i = 0; i < sizeof(directions) / sizeof(directions[0]); i++)
+    {
+        MV candidate = mv + directions[i];
+        if (!candidate.checkRange(lower, upper) || !isMctsMvValid(cu, pu, candidate))
+            continue;
+        int cost = m_me.subpelCompare(ref, candidate, primitives.pu[m_me.partEnum].satd) + m_me.mvcost(candidate);
+        if (cost < bestCost)
+        {
+            mv = candidate;
+            bestCost = cost;
+        }
+    }
+    return bestCost;
+}
+
 /* estimation of best merge coding of an inter PU (2Nx2N merge PUs are evaluated as their own mode) */
 uint32_t Search::mergeEstimation(CUData& cu, const CUGeom& cuGeom, const PredictionUnit& pu, int puIdx, MergeData& m)
 {
@@ -2240,7 +2353,8 @@ uint32_t Search::mergeEstimation(CUData& cu, const CUGeom& cuGeom, const Predict
 
     MVField  candMvField[MRG_MAX_NUM_CANDS][2];
     uint8_t  candDir[MRG_MAX_NUM_CANDS];
-    uint32_t numMergeCand = cu.getInterMergeCandidates(pu.puAbsPartIdx, puIdx, candMvField, candDir);
+    uint32_t spatialCount;
+    uint32_t numMergeCand = cu.getInterMergeCandidates(pu.puAbsPartIdx, puIdx, candMvField, candDir, &spatialCount);
 #if ENABLE_SCC_EXT
     restrictBipredMergeCand(&cu, 0, candMvField, candDir, numMergeCand);
 #else
@@ -2261,8 +2375,11 @@ uint32_t Search::mergeEstimation(CUData& cu, const CUGeom& cuGeom, const Predict
     Yuv& tempYuv = m_rqt[cuGeom.depth].tmpPredYuv;
 
     uint32_t outCost = MAX_UINT;
-    for (uint32_t mergeCand = 0; mergeCand < numMergeCand; ++mergeCand)
+    for (uint32_t mergeCand = 0; mergeCand < numMergeCand && mergeCand < spatialCount; ++mergeCand)
     {
+        if (((candDir[mergeCand] & 1) && !isMctsMvValid(cu, pu, candMvField[mergeCand][0].mv)) ||
+            ((candDir[mergeCand] & 2) && !isMctsMvValid(cu, pu, candMvField[mergeCand][1].mv)))
+            continue;
         /* Prevent TMVP candidates from using unavailable reference pixels */
         if (m_bFrameParallel)
         {
@@ -2344,8 +2461,10 @@ MV Search::getLowresMV(const CUData& cu, const PredictionUnit& pu, int list, int
 
 /* Pick between the two AMVP candidates which is the best one to use as
  * MVP for the motion search, based on SAD cost */
-int Search::selectMVP(const CUData& cu, const PredictionUnit& pu, const MV amvp[AMVP_NUM_CANDS], int list, int ref)
+int Search::selectMVP(const CUData& cu, const PredictionUnit& pu, const MV amvp[AMVP_NUM_CANDS], int list, int ref, int safeMvpIdx)
 {
+    if (safeMvpIdx >= 0)
+        return safeMvpIdx;
     if (amvp[0] == amvp[1])
         return 0;
 
@@ -2649,6 +2768,12 @@ void Search::predInterSearch(Mode& interMode, const CUGeom& cuGeom, bool bChroma
                     threadedUniL0 = validL0 && threadedMEData.ref[1] == REF_NOT_VALID;
                     threadedUniL1 = validL1 && threadedMEData.ref[0] == REF_NOT_VALID;
                     useThreadedME = threadedBidir || threadedUniL0 || threadedUniL1;
+                    // Temporal MVP candidates at tile edges may differ after extraction.
+                    if (m_param->bEnableMcts &&
+                        (cu.restrictMctsTemporalMvp() ||
+                         (validL0 && !isMctsMvValid(cu, pu, threadedMEData.mv[0])) ||
+                         (validL1 && !isMctsMvValid(cu, pu, threadedMEData.mv[1]))))
+                        useThreadedME = false;
                 }
             }
         }
@@ -2850,13 +2975,13 @@ void Search::predInterSearch(Mode& interMode, const CUGeom& cuGeom, bool bChroma
                     bits += getTUBits(ref, numIdx);
 
 #if (ENABLE_MULTIVIEW || ENABLE_SCC_EXT)
-                    int numMvc = cu.getPMV(interMode.interNeighbours, list, ref, interMode.amvpCand[list][ref], mvc, puIdx, pu.puAbsPartIdx);
+                    int numMvc = cu.getPMV(interMode.interNeighbours, list, ref, interMode.amvpCand[list][ref], mvc, puIdx, pu.puAbsPartIdx, &interMode.safeMvpIdx[list][ref]);
 #else
-                    int numMvc = cu.getPMV(interMode.interNeighbours, list, ref, interMode.amvpCand[list][ref], mvc);
+                    int numMvc = cu.getPMV(interMode.interNeighbours, list, ref, interMode.amvpCand[list][ref], mvc, &interMode.safeMvpIdx[list][ref]);
 #endif
 
                     const MV* amvp = interMode.amvpCand[list][ref];
-                    int mvpIdx = selectMVP(cu, pu, amvp, list, ref);
+                    int mvpIdx = selectMVP(cu, pu, amvp, list, ref, interMode.safeMvpIdx[list][ref]);
                     MV mvmin, mvmax, outmv, mvp = amvp[mvpIdx], mvp_lowres;
                     bool bLowresMVP = false;
 
@@ -2880,6 +3005,8 @@ void Search::predInterSearch(Mode& interMode, const CUGeom& cuGeom, bool bChroma
                     setSearchRange(cu, mvp, m_param->searchRange, mvmin, mvmax);
                     int satdCost = m_me.motionEstimate(&slice->m_mref[list][ref], mvmin, mvmax, mvp, numMvc, mvc, m_param->searchRange, outmv, m_param->maxSlices, m_vertRestriction,
                       m_param->bSourceReferenceEstimation ? m_slice->m_refFrameList[list][ref]->m_fencPic->getLumaAddr(0) : 0);
+                    if (m_param->bEnableMcts && !isMctsMvValid(cu, pu, outmv))
+                        satdCost = constrainMctsMotion(cu, pu, &slice->m_mref[list][ref], mvmin, mvmax, outmv);
 
                     if (m_param->bEnableHME && mvp_lowres.notZero() && mvp_lowres != mvp)
                     {
@@ -2904,7 +3031,7 @@ void Search::predInterSearch(Mode& interMode, const CUGeom& cuGeom, bool bChroma
                         updateMVP(amvp[mvpIdx], outmv, bits, cost, mvp_lowres);
 
                     /* Refine MVP selection, updates: mvpIdx, bits, cost */
-                    mvp = checkBestMVP(amvp, outmv, mvpIdx, bits, cost);
+                    mvp = checkBestMVP(amvp, outmv, mvpIdx, bits, cost, interMode.safeMvpIdx[list][ref]);
 
 #if ENABLE_SCC_EXT
                     if (m_param->bEnableSCC && (list <= 1 && ref <= 1 && (cu.m_partSize[0] == SIZE_2NxN || cu.m_partSize[0] == SIZE_Nx2N) && (1 << cu.m_log2CUSize[0]) <= 16))
@@ -3019,8 +3146,8 @@ void Search::predInterSearch(Mode& interMode, const CUGeom& cuGeom, bool bChroma
                 uint32_t cost = satdCost + m_rdCost.getCost(bits0) + m_rdCost.getCost(bits1);
 
                 /* refine MVP selection for zero mv, updates: mvp, mvpidx, bits, cost */
-                mvp0 = checkBestMVP(interMode.amvpCand[0][bestME[0].ref], mvzero, mvpIdx0, bits0, cost);
-                mvp1 = checkBestMVP(interMode.amvpCand[1][bestME[1].ref], mvzero, mvpIdx1, bits1, cost);
+                mvp0 = checkBestMVP(interMode.amvpCand[0][bestME[0].ref], mvzero, mvpIdx0, bits0, cost, m_param->bEnableMcts ? interMode.safeMvpIdx[0][bestME[0].ref] : -1);
+                mvp1 = checkBestMVP(interMode.amvpCand[1][bestME[1].ref], mvzero, mvpIdx1, bits1, cost, m_param->bEnableMcts ? interMode.safeMvpIdx[1][bestME[1].ref] : -1);
 
                 if (cost < bidirCost)
                 {
@@ -3060,6 +3187,7 @@ void Search::predInterSearch(Mode& interMode, const CUGeom& cuGeom, bool bChroma
                 bidir[1].mv = threadedMEData.mv[1];
                 bidir[0].mvp = interMode.amvpCand[0][bestME[0].ref][0];
                 bidir[1].mvp = interMode.amvpCand[1][bestME[1].ref][0];
+                bidir[0].mvpIdx = bidir[1].mvpIdx = 0;
                 bidir[0].mvCost = threadedMEData.mvCost[0];
                 bidir[1].mvCost = threadedMEData.mvCost[1];
                 bidirCost = threadedMEData.cost;
@@ -3073,6 +3201,7 @@ void Search::predInterSearch(Mode& interMode, const CUGeom& cuGeom, bool bChroma
 
                 bestME[0].mv = threadedMEData.mv[0];
                 bestME[0].mvp = interMode.amvpCand[0][bestME[0].ref][0];
+                bestME[0].mvpIdx = 0;
                 bestME[0].mvCost = threadedMEData.mvCost[0];
                 bestME[0].cost = threadedMEData.cost;
                 bestME[0].bits = threadedMEData.bits;
@@ -3085,6 +3214,7 @@ void Search::predInterSearch(Mode& interMode, const CUGeom& cuGeom, bool bChroma
 
                 bestME[1].mv = threadedMEData.mv[1];
                 bestME[1].mvp = interMode.amvpCand[1][bestME[1].ref][0];
+                bestME[1].mvpIdx = 0;
                 bestME[1].mvCost = threadedMEData.mvCost[1];
                 bestME[1].cost = threadedMEData.cost;
                 bestME[1].bits = threadedMEData.bits;
@@ -4944,8 +5074,13 @@ void Search::getBlkBits(PartSize cuMode, bool bPSlice, int partIdx, uint32_t las
 }
 
 /* Check if using an alternative MVP would result in a smaller MVD + signal bits */
-const MV& Search::checkBestMVP(const MV* amvpCand, const MV& mv, int& mvpIdx, uint32_t& outBits, uint32_t& outCost) const
+const MV& Search::checkBestMVP(const MV* amvpCand, const MV& mv, int& mvpIdx, uint32_t& outBits, uint32_t& outCost, int safeMvpIdx) const
 {
+    if (safeMvpIdx >= 0)
+    {
+        X265_CHECK(mvpIdx == safeMvpIdx, "unsafe temporal MVP selected at a tile boundary\n");
+        return amvpCand[mvpIdx];
+    }
     int diffBits = m_me.bitcost(mv, amvpCand[!mvpIdx]) - m_me.bitcost(mv, amvpCand[mvpIdx]);
     if (diffBits < 0)
     {

@@ -3025,7 +3025,8 @@ void Lookahead::slicetypeAnalyse(Lowres **frames, bool bKeyframe)
             {
                 for (int j = 1; j < numBFrames + 1; j++)
                 {
-                    if (scenecut(frames, j, j + 1, false, origNumFrames) ||
+                    if (((!m_param->bEnableMcts || m_param->scenecutThreshold || m_param->bHistBasedSceneCut) &&
+                         scenecut(frames, j, j + 1, false, origNumFrames)) ||
                         (bForceRADL && (frames[j]->frameNum == preRADL)))
                     {
                         frames[j]->sliceType = X265_TYPE_P;

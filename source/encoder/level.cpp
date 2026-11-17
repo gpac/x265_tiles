@@ -23,6 +23,7 @@
  *****************************************************************************/
 
 #include "common.h"
+#include "param.h"
 #include "slice.h"
 #include "level.h"
 #include "svt.h"
@@ -64,6 +65,32 @@ LevelSpec levels[] =
     { MAX_UINT, MAX_UINT64, MAX_UINT, MAX_UINT, MAX_UINT, MAX_UINT, 1, Level::LEVEL8_5, "8.5", 85 },
 };
 
+static bool tilesFitLevel(const x265_param& param, int levelIdc)
+{
+    if (levelIdc == 85 || (param.tileColumns == 1 && param.tileRows == 1 && !param.bEnableMcts))
+        return true;
+    int maxColumns = 20;
+    int maxRows = 22;
+    if (levelIdc < 30)
+        maxColumns = maxRows = 1;
+    else if (levelIdc < 31)
+        maxColumns = maxRows = 2;
+    else if (levelIdc < 40)
+        maxColumns = maxRows = 3;
+    else if (levelIdc < 50)
+        maxColumns = maxRows = 5;
+    else if (levelIdc < 60)
+    {
+        maxColumns = 10;
+        maxRows = 11;
+    }
+    int maxSlices = levelIdc < 21 ? 16 : levelIdc < 30 ? 20 : levelIdc < 31 ? 30 :
+                    levelIdc < 40 ? 40 : levelIdc < 50 ? 75 : levelIdc < 60 ? 200 :
+                    levelIdc < 70 ? 600 : 1800;
+    int64_t slices = param.bTileSlices ? (int64_t)param.tileColumns * param.tileRows * param.slicesPerTile : param.maxSlices;
+    return param.tileColumns <= maxColumns && param.tileRows <= maxRows && slices <= maxSlices;
+}
+
 /* determine minimum decoder level required to decode the described video */
 void determineLevel(const x265_param &param, VPS& vps)
 {
@@ -72,8 +99,6 @@ void determineLevel(const x265_param &param, VPS& vps)
     vps.ptl.bitDepthConstraint = param.internalBitDepth;
     vps.ptl.chromaFormatConstraint = param.internalCsp;
 
-    /* TODO: figure out HighThroughput signaling, aka: HbrFactor in section A.4.2, only available
-     * for intra-only profiles (vps.ptl.intraConstraintFlag) */
     vps.ptl.lowerBitRateConstraintFlag = true;
 
     vps.maxTempSubLayers = !!param.bEnableTemporalSubLayers ? param.bEnableTemporalSubLayers : 1;
@@ -111,6 +136,15 @@ void determineLevel(const x265_param &param, VPS& vps)
     }
     else
         vps.ptl.profileIdc[0] = Profile::MAINREXT;
+
+    if (param.bEnableWavefront && (param.tileColumns > 1 || param.tileRows > 1 || param.bEnableMcts))
+    {
+        vps.ptl.profileIdc[0] = Profile::HIGHTHROUGHPUTREXT;
+        vps.ptl.bitDepthConstraint = param.internalBitDepth <= 8 ? 8 : param.internalBitDepth <= 10 ? 10 : 14;
+        vps.ptl.chromaFormatConstraint = X265_CSP_I444;
+        vps.ptl.intraConstraintFlag = false;
+        vps.ptl.onePictureOnlyConstraintFlag = false;
+    }
 
 #if ENABLE_MULTIVIEW
     if (param.numViews == 2)
@@ -187,6 +221,8 @@ void determineLevel(const x265_param &param, VPS& vps)
             continue;
         else if (param.sourceHeight > sqrt(levels[i].maxLumaSamples * 8.0f))
             continue;
+        else if (!tilesFitLevel(param, levels[i].levelIdc))
+            continue;
         else if (param.levelIdc && param.levelIdc != levels[i].levelIdc)
             continue;
         uint32_t maxDpbSize = MaxDpbPicBuf;
@@ -250,7 +286,14 @@ void determineLevel(const x265_param &param, VPS& vps)
         break;
     }
 
-    static const char* profiles[] = { "None", "Main", "Main 10", "Main Still Picture", "RExt", "", "", "", "", "Main Scc" };
+    if (!x265_tiles_fit_profile(&param, true))
+    {
+        x265_log(&param, X265_LOG_WARNING, "tile dimensions are non-conformant; no profile is claimed\n");
+        vps.ptl.profileIdc[0] = Profile::NONE;
+        memset(vps.ptl.profileCompatibilityFlag, 0, sizeof(vps.ptl.profileCompatibilityFlag));
+    }
+
+    static const char* profiles[] = { "None", "Main", "Main 10", "Main Still Picture", "RExt", "High Throughput RExt", "", "", "", "Main Scc" };
     static const char *tiers[]    = { "Main", "High" };
 
     char profbuf[64];
@@ -391,6 +434,11 @@ bool enforceLevel(x265_param& param, VPS& vps)
     }
 
     LevelSpec& l = levels[level];
+    if (!tilesFitLevel(param, l.levelIdc))
+    {
+        x265_log(&param, X265_LOG_ERROR, "tile grid or slice count exceeds the limits of the specified level\n");
+        return false;
+    }
 
     //highTier is allowed for this level and has not been explicitly disabled. This does not mean it is the final chosen tier
     bool allowHighTier = l.maxBitrateHigh < MAX_UINT && param.bHighTier;
@@ -609,6 +657,7 @@ int x265_param_apply_profile(x265_param *param, const char *profile)
         return -1;
     }
 
+    param->bExplicitProfile = 1;
     return 0;
 }
 }

@@ -43,6 +43,23 @@ void Deblock::deblockCTU(const CUData* ctu, const CUGeom& cuGeom, int32_t dir)
     deblockCU(ctu, cuGeom, dir, blockStrength);
 }
 
+static const CUData* getFilterNeighbour(const CUData* cu, uint32_t& partIdx, uint32_t curPartIdx, int32_t dir)
+{
+    const CUData* neighbour = dir == Deblock::EDGE_VER ? cu->getPULeft(partIdx, curPartIdx) :
+                                                        cu->getPUAbove(partIdx, curPartIdx);
+    if (neighbour || !cu->m_slice->m_pps->bLoopFilterAcrossTiles || cu->m_slice->m_param->bTileSlices)
+        return neighbour;
+
+    TileLayout tiles(*cu->m_slice->m_sps, *cu->m_slice->m_pps);
+    uint32_t col = cu->m_cuAddr % tiles.width;
+    uint32_t row = cu->m_cuAddr / tiles.width;
+    if (dir == Deblock::EDGE_VER && col && tiles.id(col, row) != tiles.id(col - 1, row))
+        return cu->m_encData->getPicCTU(cu->m_cuAddr - 1);
+    if (dir == Deblock::EDGE_HOR && row && tiles.id(col, row) != tiles.id(col, row - 1))
+        return cu->m_encData->getPicCTU(cu->m_cuAddr - tiles.width);
+    return NULL;
+}
+
 static inline uint8_t bsCuEdge(const CUData* cu, uint32_t absPartIdx, int32_t dir)
 {
     if (dir == Deblock::EDGE_VER)
@@ -50,7 +67,7 @@ static inline uint8_t bsCuEdge(const CUData* cu, uint32_t absPartIdx, int32_t di
         if (cu->m_cuPelX + g_zscanToPelX[absPartIdx] > 0)
         {
             uint32_t    tempPartIdx;
-            const CUData* tempCU = cu->getPULeft(tempPartIdx, absPartIdx);
+            const CUData* tempCU = getFilterNeighbour(cu, tempPartIdx, absPartIdx, dir);
             return tempCU ? 2 : 0;
         }
     }
@@ -59,7 +76,7 @@ static inline uint8_t bsCuEdge(const CUData* cu, uint32_t absPartIdx, int32_t di
         if (cu->m_cuPelY + g_zscanToPelY[absPartIdx] > 0)
         {
             uint32_t    tempPartIdx;
-            const CUData* tempCU = cu->getPUAbove(tempPartIdx, absPartIdx);
+            const CUData* tempCU = getFilterNeighbour(cu, tempPartIdx, absPartIdx, dir);
             return tempCU ? 2 : 0;
         }
     }
@@ -192,7 +209,7 @@ uint8_t Deblock::getBoundaryStrength(const CUData* cuQ, int32_t dir, uint32_t pa
 {
     // Calculate block index
     uint32_t partP;
-    const CUData* cuP = (dir == EDGE_VER ? cuQ->getPULeft(partP, partQ) : cuQ->getPUAbove(partP, partQ));
+    const CUData* cuP = getFilterNeighbour(cuQ, partP, partQ, dir);
 
     // Set BS for Intra MB : BS = 2
     if (cuP->isIntra(partP) || cuQ->isIntra(partQ))
@@ -353,7 +370,7 @@ void Deblock::edgeFilterLuma(const CUData* cuQ, uint32_t absPartIdx, uint32_t de
 
         // Derive neighboring PU index
         uint32_t partP;
-        const CUData* cuP = (dir == EDGE_VER ? cuQ->getPULeft(partP, partQ) : cuQ->getPUAbove(partP, partQ));
+        const CUData* cuP = getFilterNeighbour(cuQ, partP, partQ, dir);
 
         if (bCheckNoFilter)
         {
@@ -464,7 +481,7 @@ void Deblock::edgeFilterChroma(const CUData* cuQ, uint32_t absPartIdx, uint32_t 
 
         // Derive neighboring PU index
         uint32_t partP;
-        const CUData* cuP = (dir == EDGE_VER ? cuQ->getPULeft(partP, partQ) : cuQ->getPUAbove(partP, partQ));
+        const CUData* cuP = getFilterNeighbour(cuQ, partP, partQ, dir);
 
         if (bCheckNoFilter)
         {

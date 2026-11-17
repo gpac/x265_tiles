@@ -51,6 +51,9 @@ FrameEncoder::FrameEncoder()
     m_outStreams = NULL;
     m_backupStreams = NULL;
     m_substreamSizes = NULL;
+    m_tileCoders = NULL;
+    m_tileContexts = NULL;
+    m_backupTileCoders = NULL;
     m_nr = NULL;
     m_tld = NULL;
     m_rows = NULL;
@@ -91,6 +94,9 @@ void FrameEncoder::destroy()
     delete[] m_rows;
     delete[] m_outStreams;
     delete[] m_backupStreams;
+    delete[] m_tileCoders;
+    delete[] m_tileContexts;
+    delete[] m_backupTileCoders;
     X265_FREE(m_sliceBaseRow);
     X265_FREE((void*)m_bAllRowsStop);
     X265_FREE((void*)m_vbvResetTriggerRow);
@@ -734,7 +740,11 @@ void FrameEncoder::compressFrame(int layer)
     // reset slice counter for rate control update
     m_sliceCnt = 0;
 
-    uint32_t numSubstreams = m_param->bEnableWavefront ? slice->m_sps->numCuInHeight : m_param->maxSlices;
+    const bool tilesEnabled = slice->m_pps->tileColumns > 1 || slice->m_pps->tileRows > 1;
+    uint32_t numSubstreams = tilesEnabled ? slice->m_pps->tileColumns *
+                             (m_param->bEnableWavefront ? slice->m_sps->numCuInHeight :
+                              slice->m_pps->tileRows * slice->m_pps->slicesPerTile) :
+                             m_param->bEnableWavefront ? slice->m_sps->numCuInHeight : m_param->maxSlices;
     X265_CHECK(m_param->bEnableWavefront || (m_param->maxSlices == 1), "Multiple slices without WPP unsupport now!");
     if (!m_outStreams)
     {
@@ -742,22 +752,28 @@ void FrameEncoder::compressFrame(int layer)
         if (!m_param->bEnableWavefront)
             m_backupStreams = new Bitstream[numSubstreams];
         m_substreamSizes = X265_MALLOC(uint32_t, numSubstreams);
-        if (!slice->m_bUseSao)
+        if (tilesEnabled)
         {
-            for (uint32_t i = 0; i < numSubstreams; i++)
-                m_rows[i].rowGoOnCoder.setBitstream(&m_outStreams[i]);
+            m_tileCoders = new Entropy[numSubstreams];
+            if (m_param->bEnableWavefront)
+                m_tileContexts = new Entropy[numSubstreams];
         }
     }
-    else
+    if (tilesEnabled && !m_param->bEnableWavefront && !m_backupTileCoders &&
+        m_param->rc.vbvBufferSize && m_param->rc.vbvMaxBitrate)
+        m_backupTileCoders = new Entropy[numSubstreams];
+    for (uint32_t i = 0; i < numSubstreams; i++)
     {
-        for (uint32_t i = 0; i < numSubstreams; i++)
+        m_outStreams[i].resetBits();
+        if (tilesEnabled)
         {
-            m_outStreams[i].resetBits();
-            if (!slice->m_bUseSao)
-                m_rows[i].rowGoOnCoder.setBitstream(&m_outStreams[i]);
-            else
-                m_rows[i].rowGoOnCoder.setBitstream(NULL);
+            m_tileCoders[i].setBitstream(slice->m_bUseSao ? NULL : &m_outStreams[i]);
+            m_tileCoders[i].load(m_initSliceContext);
         }
+        else if (!slice->m_bUseSao)
+            m_rows[i].rowGoOnCoder.setBitstream(&m_outStreams[i]);
+        else
+            m_rows[i].rowGoOnCoder.setBitstream(NULL);
     }
 
     m_rce.encodeOrder = m_frame[layer]->m_encodeOrder;
@@ -1168,7 +1184,35 @@ void FrameEncoder::compressFrame(int layer)
 
     m_entropyCoder.setBitstream(&m_bs);
 
-    if (m_param->maxSlices > 1)
+    if (m_param->bTileSlices)
+    {
+        TileLayout tiles(*slice->m_sps, *slice->m_pps);
+        if (m_param->bOptRefListLengthPPS)
+        {
+            ScopedLock refIdxLock(m_top->m_sliceRefIdxLock);
+            m_top->analyseRefIdx(slice->m_numRefIdx);
+        }
+        uint32_t sliceCount = tiles.columns * tiles.rows * tiles.pps.slicesPerTile;
+        for (uint32_t stream = 0; stream < sliceCount; stream++)
+        {
+            uint32_t tile = stream / tiles.pps.slicesPerTile;
+            uint32_t band = stream % tiles.pps.slicesPerTile;
+            uint32_t col = tiles.columnStart(tile % tiles.columns);
+            uint32_t row = tiles.sliceRowStart(tile / tiles.columns, band);
+            uint32_t sliceAddr = row * tiles.width + col;
+            uint32_t firstStream = m_param->bEnableWavefront ? tiles.wavefrontStream(col, row) : stream;
+            uint32_t streamCount = m_param->bEnableWavefront ?
+                tiles.sliceRowStart(tile / tiles.columns, band + 1) - row : 1;
+            m_bs.resetBits();
+            m_entropyCoder.codeSliceHeader(*slice, *m_frame[layer]->m_encData, sliceAddr, m_sliceAddrBits, slice->m_sliceQp, layer);
+            uint32_t maxStreamSize = m_nalList.serializeSubstreams(m_substreamSizes, streamCount, &m_outStreams[firstStream]);
+            m_entropyCoder.setBitstream(&m_bs);
+            m_entropyCoder.codeSliceHeaderWPPEntryPoints(m_substreamSizes, streamCount - 1, maxStreamSize);
+            m_bs.writeByteAlignment();
+            m_nalList.serialize(slice->m_nalUnitType, m_bs, layer, (!!m_param->bEnableTemporalSubLayers ? m_frame[layer]->m_tempLayer + 1 : (1 + (slice->m_nalUnitType == NAL_UNIT_CODED_SLICE_TSA_N))));
+        }
+    }
+    else if (m_param->maxSlices > 1)
     {
         uint32_t nextSliceRow = 0;
 
@@ -1216,8 +1260,8 @@ void FrameEncoder::compressFrame(int layer)
 
         // complete the slice header by writing WPP row-starts
         m_entropyCoder.setBitstream(&m_bs);
-        if (slice->m_pps->bEntropyCodingSyncEnabled)
-            m_entropyCoder.codeSliceHeaderWPPEntryPoints(m_substreamSizes, (slice->m_sps->numCuInHeight - 1), maxStreamSize);
+        if (slice->m_pps->bEntropyCodingSyncEnabled || tilesEnabled)
+            m_entropyCoder.codeSliceHeaderWPPEntryPoints(m_substreamSizes, numSubstreams - 1, maxStreamSize);
         m_bs.writeByteAlignment();
 
         m_nalList.serialize(slice->m_nalUnitType, m_bs, layer, (!!m_param->bEnableTemporalSubLayers ? m_frame[layer]->m_tempLayer + 1 : (1 + (slice->m_nalUnitType == NAL_UNIT_CODED_SLICE_TSA_N))));
@@ -1226,17 +1270,24 @@ void FrameEncoder::compressFrame(int layer)
     if (m_param->decodedPictureHashSEI)
         writeTrailingSEIMessages(layer);
 
+    const bool tiledVbv = tilesEnabled && m_top->m_rateControl->m_isVbv;
+    if (tiledVbv && m_frame[layer]->m_rpu.payloadSize)
+        writeRpu(layer);
+
     uint64_t bytes = 0;
     for (uint32_t i = 0; i < m_nalList.m_numNal; i++)
     {
         int type = m_nalList.m_nal[i].type;
 
-        // exclude SEI
-        if (type != NAL_UNIT_PREFIX_SEI && type != NAL_UNIT_SUFFIX_SEI)
+        if (tiledVbv || (type != NAL_UNIT_PREFIX_SEI && type != NAL_UNIT_SUFFIX_SEI))
         {
             bytes += m_nalList.m_nal[i].sizeBytes;
-            // and exclude start code prefix
-            bytes -= (!i || type == NAL_UNIT_SPS || type == NAL_UNIT_PPS) ? 4 : 3;
+            if (tiledVbv)
+                bytes -= (!m_param->bAnnexB || !i || type == NAL_UNIT_VPS ||
+                          type == NAL_UNIT_SPS || type == NAL_UNIT_PPS ||
+                          type == NAL_UNIT_UNSPECIFIED) ? 4 : 3;
+            else
+                bytes -= (!i || type == NAL_UNIT_SPS || type == NAL_UNIT_PPS) ? 4 : 3;
         }
     }
     m_accessUnitBits[layer] = (layer) ? (bytes - (m_accessUnitBits[0] >> 3)) << 3 : bytes << 3;
@@ -1274,17 +1325,12 @@ void FrameEncoder::compressFrame(int layer)
         m_bs.writeByteAlignment();
         m_nalList.serialize(NAL_UNIT_FILLER_DATA, m_bs);
         bytes += m_nalList.m_nal[m_nalList.m_numNal - 1].sizeBytes;
-        bytes -= 3; //exclude start code prefix
+        bytes -= (tiledVbv && !m_param->bAnnexB) ? 4 : 3;
         m_accessUnitBits[layer] = bytes << 3;
     }
 
-    if (m_frame[layer]->m_rpu.payloadSize)
-    {
-        m_bs.resetBits();
-        for (int i = 0; i < m_frame[layer]->m_rpu.payloadSize; i++)
-            m_bs.write(m_frame[layer]->m_rpu.payload[i], 8);
-        m_nalList.serialize(NAL_UNIT_UNSPECIFIED, m_bs);
-    }
+    if (!tiledVbv && m_frame[layer]->m_rpu.payloadSize)
+        writeRpu(layer);
 
     m_endCompressTime[layer] = x265_mdate();
 
@@ -1338,6 +1384,14 @@ void FrameEncoder::compressFrame(int layer)
 #endif
 
     m_endFrameTime[layer] = x265_mdate();
+}
+
+void FrameEncoder::writeRpu(int layer)
+{
+    m_bs.resetBits();
+    for (int i = 0; i < m_frame[layer]->m_rpu.payloadSize; i++)
+        m_bs.write(m_frame[layer]->m_rpu.payload[i], 8);
+    m_nalList.serialize(NAL_UNIT_UNSPECIFIED, m_bs);
 }
 
 void FrameEncoder::initDecodedPictureHashSEI(int row, int cuAddr, int height, int layer)
@@ -1418,6 +1472,19 @@ void FrameEncoder::encodeSlice(uint32_t sliceAddr, int layer)
     const uint32_t widthInLCUs = slice->m_sps->numCuInWidth;
     const uint32_t lastCUAddr = (slice->m_endCUAddr + m_param->num4x4Partitions - 1) / m_param->num4x4Partitions;
     const uint32_t numSubstreams = m_param->bEnableWavefront ? slice->m_sps->numCuInHeight : 1;
+    TileLayout tiles(*slice->m_sps, *slice->m_pps);
+    const bool tilesEnabled = tiles.columns > 1 || tiles.rows > 1;
+    if (tilesEnabled)
+    {
+        uint32_t tileStreams = m_param->bEnableWavefront ? tiles.columns * tiles.height :
+                               tiles.columns * tiles.rows * tiles.pps.slicesPerTile;
+        for (uint32_t i = 0; i < tileStreams; i++)
+        {
+            m_outStreams[i].resetBits();
+            m_tileCoders[i].setBitstream(&m_outStreams[i]);
+            m_tileCoders[i].load(m_initSliceContext);
+        }
+    }
 
     SAOParam* saoParam = slice->m_sps->bUseSAO && slice->m_bUseSao ? m_frame[layer]->m_encData->m_saoParam : NULL;
     for (uint32_t cuAddr = sliceAddr; cuAddr < lastCUAddr; cuAddr++)
@@ -1426,38 +1493,50 @@ void FrameEncoder::encodeSlice(uint32_t sliceAddr, int layer)
         uint32_t row = cuAddr / widthInLCUs;
         uint32_t subStrm = row % numSubstreams;
         CUData* ctu = m_frame[layer]->m_encData->getPicCTU(cuAddr);
+        uint32_t tileStream = tilesEnabled ? (m_param->bEnableWavefront ? tiles.wavefrontStream(col, row) : tiles.sliceId(col, row)) : 0;
+        Entropy& coder = tilesEnabled ? m_tileCoders[tileStream] : m_entropyCoder;
 
-        m_entropyCoder.setBitstream(&m_outStreams[subStrm]);
+        if (!tilesEnabled)
+            coder.setBitstream(&m_outStreams[subStrm]);
 
         // Synchronize cabac probabilities with upper-right CTU if it's available and we're at the start of a line.
-        if (m_param->bEnableWavefront && !col && row)
+        if (!tilesEnabled && m_param->bEnableWavefront && !col && row)
         {
             m_entropyCoder.copyState(m_initSliceContext);
             m_entropyCoder.loadContexts(m_rows[row - 1].bufferedEntropy);
         }
 
         // Initialize slice context
-        if (ctu->m_bFirstRowInSlice && !col)
+        if (!tilesEnabled && ctu->m_bFirstRowInSlice && !col)
             m_entropyCoder.load(m_initSliceContext);
+        if (tilesEnabled && m_param->bEnableWavefront && col == tiles.columnStart(tiles.column(col)) &&
+            row != tiles.sliceRowStart(tiles.row(row), tiles.sliceBand(row)))
+        {
+            coder.copyState(m_initSliceContext);
+            coder.loadContexts(m_tileContexts[tiles.wavefrontStream(col, row - 1)]);
+        }
 
         if (saoParam)
         {
             if (saoParam->bSaoFlag[0] || saoParam->bSaoFlag[1])
             {
-                int mergeLeft = col && saoParam->ctuParam[0][cuAddr].mergeMode == SAO_MERGE_LEFT;
-                int mergeUp = !ctu->m_bFirstRowInSlice && saoParam->ctuParam[0][cuAddr].mergeMode == SAO_MERGE_UP;
-                if (col)
-                    m_entropyCoder.codeSaoMerge(mergeLeft);
-                if (!ctu->m_bFirstRowInSlice && !mergeLeft)
-                    m_entropyCoder.codeSaoMerge(mergeUp);
+                bool leftAvailable = col && tiles.id(col - 1, row) == tiles.id(col, row);
+                bool upAvailable = !ctu->m_bFirstRowInSlice && row &&
+                                   tiles.id(col, row - 1) == tiles.id(col, row);
+                int mergeLeft = leftAvailable && saoParam->ctuParam[0][cuAddr].mergeMode == SAO_MERGE_LEFT;
+                int mergeUp = upAvailable && saoParam->ctuParam[0][cuAddr].mergeMode == SAO_MERGE_UP;
+                if (leftAvailable)
+                    coder.codeSaoMerge(mergeLeft);
+                if (upAvailable && !mergeLeft)
+                    coder.codeSaoMerge(mergeUp);
                 if (!mergeLeft && !mergeUp)
                 {
                     if (saoParam->bSaoFlag[0])
-                        m_entropyCoder.codeSaoOffset(saoParam->ctuParam[0][cuAddr], 0);
+                        coder.codeSaoOffset(saoParam->ctuParam[0][cuAddr], 0);
                     if (saoParam->bSaoFlag[1])
                     {
-                        m_entropyCoder.codeSaoOffset(saoParam->ctuParam[1][cuAddr], 1);
-                        m_entropyCoder.codeSaoOffset(saoParam->ctuParam[2][cuAddr], 2);
+                        coder.codeSaoOffset(saoParam->ctuParam[1][cuAddr], 1);
+                        coder.codeSaoOffset(saoParam->ctuParam[2][cuAddr], 2);
                     }
                 }
             }
@@ -1469,9 +1548,17 @@ void FrameEncoder::encodeSlice(uint32_t sliceAddr, int layer)
         }
 
         // final coding (bitstream generation) for this CU
-        m_entropyCoder.encodeCTU(*ctu, m_cuGeoms[m_ctuGeomMap[cuAddr]]);
+        coder.encodeCTU(*ctu, m_cuGeoms[m_ctuGeomMap[cuAddr]]);
 
-        if (m_param->bEnableWavefront)
+        if (tilesEnabled && m_param->bEnableWavefront && col == tiles.columnStart(tiles.column(col)) + 1)
+            m_tileContexts[tileStream].loadContexts(coder);
+
+        if (tilesEnabled && (m_param->bEnableWavefront ?
+                             col + 1 == tiles.columnStart(tiles.column(col) + 1) :
+                             tiles.isLastInSlice(col, row)))
+            coder.finishSlice();
+
+        if (!tilesEnabled && m_param->bEnableWavefront)
         {
             if (col == 1)
                 // Store probabilities of second CTU in line into buffer
@@ -1482,7 +1569,7 @@ void FrameEncoder::encodeSlice(uint32_t sliceAddr, int layer)
         }
     }
 
-    if (!m_param->bEnableWavefront)
+    if (!tilesEnabled && !m_param->bEnableWavefront)
         m_entropyCoder.finishSlice();
 }
 
@@ -1542,9 +1629,11 @@ void FrameEncoder::processRowEncoder(int intRow, ThreadLocalData& tld, int layer
 
     /* When WPP is enabled, every row has its own row coder instance. Otherwise
      * they share row 0 */
-    Entropy& rowCoder = m_param->bEnableWavefront ? curRow.rowGoOnCoder : m_rows[0].rowGoOnCoder;
+    Entropy& rowStartCoder = m_param->bEnableWavefront ? curRow.rowGoOnCoder : m_rows[0].rowGoOnCoder;
     FrameData& curEncData = *m_frame[layer]->m_encData;
     Slice *slice = curEncData.m_slice;
+    TileLayout tiles(*slice->m_sps, *slice->m_pps);
+    const bool tilesEnabled = tiles.columns > 1 || tiles.rows > 1;
 
     const uint32_t numCols = m_numCols;
     const uint32_t lineStartCUAddr = row * numCols;
@@ -1560,7 +1649,7 @@ void FrameEncoder::processRowEncoder(int intRow, ThreadLocalData& tld, int layer
 
     // Load SBAC coder context from previous row and initialize row state.
     if (bFirstRowInSlice && !curRow.completed)        
-        rowCoder.load(m_initSliceContext);     
+        rowStartCoder.load(m_initSliceContext);
 
     // calculate mean QP for consistent deltaQP signalling calculation
     if (m_param->bOptCUDeltaQP)
@@ -1610,11 +1699,11 @@ void FrameEncoder::processRowEncoder(int intRow, ThreadLocalData& tld, int layer
                     }
                     meanQPOff /= count;
                 }
-                rowCoder.m_meanQP = slice->m_sliceQp + meanQPOff;
+                rowStartCoder.m_meanQP = slice->m_sliceQp + meanQPOff;
             }
             else
             {
-                rowCoder.m_meanQP = m_rows[0].rowGoOnCoder.m_meanQP;
+                rowStartCoder.m_meanQP = m_rows[0].rowGoOnCoder.m_meanQP;
             }
             curRow.avgQPComputed = 1;
         }
@@ -1641,8 +1730,12 @@ void FrameEncoder::processRowEncoder(int intRow, ThreadLocalData& tld, int layer
 
         const uint32_t col = curRow.completed;
         const uint32_t cuAddr = lineStartCUAddr + col;
+        uint32_t tileStream = tilesEnabled ? (m_param->bEnableWavefront ? tiles.wavefrontStream(col, row) : tiles.sliceId(col, row)) : 0;
+        Entropy& rowCoder = tilesEnabled ? m_tileCoders[tileStream] :
+                            (m_param->bEnableWavefront ? curRow.rowGoOnCoder : m_rows[0].rowGoOnCoder);
         CUData* ctu = curEncData.getPicCTU(cuAddr);
-        const uint32_t bLastCuInSlice = (bLastRowInSlice & (col == numCols - 1)) ? 1 : 0;
+        const uint32_t bLastCuInSlice = m_param->bTileSlices ? tiles.isLastInSlice(col, row) :
+                                       (bLastRowInSlice & (col == numCols - 1)) ? 1 : 0;
 
         /* Must wait for TME to finish before initCTU because both threads
          * operate on the same CUData — the encoder's initCTU would corrupt
@@ -1666,15 +1759,37 @@ void FrameEncoder::processRowEncoder(int intRow, ThreadLocalData& tld, int layer
                 ATOMIC_ADD(&m_totalThreadedMEWait[layer], waitEnd - waitStart);
         }
 
-        ctu->initCTU(*m_frame[layer], cuAddr, slice->m_sliceQp, bFirstRowInSlice, bLastRowInSlice, bLastCuInSlice);
+        bool tileSliceRows = tilesEnabled && tiles.pps.slicesPerTile > 1;
+        bool firstRow = tileSliceRows ? row == tiles.sliceRowStart(tiles.row(row), tiles.sliceBand(row)) : bFirstRowInSlice;
+        bool lastRow = tileSliceRows ? row + 1 == tiles.sliceRowStart(tiles.row(row), tiles.sliceBand(row) + 1) : bLastRowInSlice;
+        ctu->initCTU(*m_frame[layer], cuAddr, slice->m_sliceQp, firstRow, lastRow, bLastCuInSlice);
+
+        if (tilesEnabled && m_param->bEnableWavefront && col == tiles.columnStart(tiles.column(col)) &&
+            row != tiles.sliceRowStart(tiles.row(row), tiles.sliceBand(row)))
+        {
+            rowCoder.copyState(m_initSliceContext);
+            rowCoder.loadContexts(m_tileContexts[tiles.wavefrontStream(col, row - 1)]);
+        }
 
         if (!layer && bIsVbv)
         {
             if (col == 0 && !m_param->bEnableWavefront)
             {
-                m_backupStreams[0].copyBits(&m_outStreams[0]);
-                curRow.bufferedEntropy.copyState(rowCoder);
-                curRow.bufferedEntropy.loadContexts(rowCoder);
+                if (tilesEnabled)
+                {
+                    for (uint32_t tileCol = 0; tileCol < tiles.columns; tileCol++)
+                    {
+                        uint32_t stream = tiles.sliceId(tiles.columnStart(tileCol), row);
+                        m_backupStreams[stream].copyBits(&m_outStreams[stream]);
+                        m_backupTileCoders[stream].load(m_tileCoders[stream]);
+                    }
+                }
+                else
+                {
+                    m_backupStreams[0].copyBits(&m_outStreams[0]);
+                    curRow.bufferedEntropy.copyState(rowCoder);
+                    curRow.bufferedEntropy.loadContexts(rowCoder);
+                }
             }
             if (bFirstRowInSlice && m_vbvResetTriggerRow[curRow.sliceId] != intRow)
             {
@@ -1713,12 +1828,14 @@ void FrameEncoder::processRowEncoder(int intRow, ThreadLocalData& tld, int layer
         else
             curEncData.m_cuStat[cuAddr].baseQp = curEncData.m_avgQpRc;
 
-        if (m_param->bEnableWavefront && !col && !bFirstRowInSlice)
+        if (!tilesEnabled && m_param->bEnableWavefront && !col && !bFirstRowInSlice)
         {
             // Load SBAC coder context from previous row and initialize row state.
             rowCoder.copyState(m_initSliceContext);
             rowCoder.loadContexts(m_rows[row - 1].bufferedEntropy);
         }
+        if (tilesEnabled && m_param->bOptCUDeltaQP)
+            rowCoder.m_meanQP = rowStartCoder.m_meanQP;
         if (m_param->dynamicRd && (int32_t)(m_rce.qpaRc - m_rce.qpNoVbv) > 0)
             ctu->m_vbvAffected = true;
 
@@ -1738,8 +1855,14 @@ void FrameEncoder::processRowEncoder(int intRow, ThreadLocalData& tld, int layer
         /* advance top-level row coder to include the context of this CTU.
          * if SAO is disabled, rowCoder writes the final CTU bitstream */
         rowCoder.encodeCTU(*ctu, m_cuGeoms[m_ctuGeomMap[cuAddr]]);
+        if (tilesEnabled && m_param->bEnableWavefront && col == tiles.columnStart(tiles.column(col)) + 1)
+            m_tileContexts[tileStream].loadContexts(rowCoder);
 
-        if (m_param->bEnableWavefront && col == 1)
+        if (tilesEnabled && !slice->m_bUseSao && (m_param->bEnableWavefront ?
+            col + 1 == tiles.columnStart(tiles.column(col) + 1) : tiles.isLastInSlice(col, row)))
+            rowCoder.finishSlice();
+
+        if (!tilesEnabled && m_param->bEnableWavefront && col == 1)
             // Save CABAC state for next row
             curRow.bufferedEntropy.loadContexts(rowCoder);
 
@@ -1863,10 +1986,21 @@ void FrameEncoder::processRowEncoder(int intRow, ThreadLocalData& tld, int layer
                         m_frame[layer]->m_poc, row, qpBase, curEncData.m_cuStat[cuAddr].baseQp);
 
                     m_vbvResetTriggerRow[curRow.sliceId] = row;
-                    m_outStreams[0].copyBits(&m_backupStreams[0]);
-
-                    rowCoder.copyState(curRow.bufferedEntropy);
-                    rowCoder.loadContexts(curRow.bufferedEntropy);
+                    if (tilesEnabled)
+                    {
+                        for (uint32_t tileCol = 0; tileCol < tiles.columns; tileCol++)
+                        {
+                            uint32_t stream = tiles.sliceId(tiles.columnStart(tileCol), row);
+                            m_outStreams[stream].copyBits(&m_backupStreams[stream]);
+                            m_tileCoders[stream].load(m_backupTileCoders[stream]);
+                        }
+                    }
+                    else
+                    {
+                        m_outStreams[0].copyBits(&m_backupStreams[0]);
+                        rowCoder.copyState(curRow.bufferedEntropy);
+                        rowCoder.loadContexts(curRow.bufferedEntropy);
+                    }
 
                     curRow.completed = 0;
                     memset(&curRow.rowStats, 0, sizeof(curRow.rowStats));
@@ -1954,7 +2088,17 @@ void FrameEncoder::processRowEncoder(int intRow, ThreadLocalData& tld, int layer
                             while (bRowBusy);
                         }
 
-                        m_outStreams[r].resetBits();
+                        if (tilesEnabled)
+                        {
+                            for (uint32_t tileCol = 0; tileCol < tiles.columns; tileCol++)
+                            {
+                                uint32_t stream = tiles.wavefrontStream(tiles.columnStart(tileCol), r);
+                                m_outStreams[stream].resetBits();
+                                m_tileCoders[stream].load(m_initSliceContext);
+                            }
+                        }
+                        else
+                            m_outStreams[r].resetBits();
                         stopRow.completed = 0;
                         memset(&stopRow.rowStats, 0, sizeof(stopRow.rowStats));
                         curEncData.m_rowStat[r].numEncodedCUs = 0;
@@ -2062,8 +2206,8 @@ void FrameEncoder::processRowEncoder(int intRow, ThreadLocalData& tld, int layer
 
     /* flush row bitstream (if WPP and no SAO) or flush frame if no WPP and no SAO */
     /* end_of_sub_stream_one_bit / end_of_slice_segment_flag */
-       if (!slice->m_bUseSao && (m_param->bEnableWavefront || bLastRowInSlice))
-               rowCoder.finishSlice();
+       if (!tilesEnabled && !slice->m_bUseSao && (m_param->bEnableWavefront || bLastRowInSlice))
+               rowStartCoder.finishSlice();
 
 
     /* Processing left Deblock block with current threading */

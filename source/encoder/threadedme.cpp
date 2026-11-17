@@ -247,10 +247,14 @@ void initCTU(CUData& ctu, int row, int col, CTUTask& task)
     Slice *slice = frame.m_encData->m_slice;
     CTURow& ctuRow = frameEnc.m_rows[row];
 
-    const uint32_t bFirstRowInSlice = ((row == 0) || (frameEnc.m_rows[row - 1].sliceId != ctuRow.sliceId)) ? 1 : 0;
-    const uint32_t bLastRowInSlice = ((row == numRows - 1) || (frameEnc.m_rows[row + 1].sliceId != ctuRow.sliceId)) ? 1 : 0;
-
-    const uint32_t bLastCuInSlice = (bLastRowInSlice & (col == numCols - 1)) ? 1 : 0;
+    TileLayout tiles(*slice->m_sps, *slice->m_pps);
+    bool tileSliceRows = (tiles.columns > 1 || tiles.rows > 1) && tiles.pps.slicesPerTile > 1;
+    const uint32_t bFirstRowInSlice = tileSliceRows ? row == (int)tiles.sliceRowStart(tiles.row(row), tiles.sliceBand(row)) :
+        (row == 0 || frameEnc.m_rows[row - 1].sliceId != ctuRow.sliceId);
+    const uint32_t bLastRowInSlice = tileSliceRows ? row + 1 == (int)tiles.sliceRowStart(tiles.row(row), tiles.sliceBand(row) + 1) :
+        (row == numRows - 1 || frameEnc.m_rows[row + 1].sliceId != ctuRow.sliceId);
+    const uint32_t bLastCuInSlice = frame.m_param->bTileSlices ? tiles.isLastInSlice(col, row) :
+        (bLastRowInSlice && col == numCols - 1);
 
     int ctuAddr = (numCols * row) + col;
 

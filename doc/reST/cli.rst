@@ -460,6 +460,124 @@ Performance Options
 
 	Default: 1 slice per frame. **Experimental feature**
 
+.. option:: --tile-columns <integer|list>, --tile-rows <integer|list>
+
+	Divide each picture into HEVC tiles. A single integer specifies a
+	uniform tile count; a comma-separated list of at least two integers
+	specifies widths or heights in luma pixels. Interior boundaries must
+	be CTU-aligned. If the list does not cover the visible picture, the
+	remaining CTUs form a final tile; the final tile includes any coded
+	padding. For example, on a 1024-pixel-wide picture,
+	``--tile-columns 256,256`` produces columns of 256, 256 and 512 pixels.
+	The default is one column and one row (tiles disabled). Each tile must
+	contain visible samples. At most 20 columns and 22 rows are supported,
+	with further limits on tile and slice counts at the signaled HEVC level.
+	With the x265 encoder, tile columns must be at least 256 luma samples
+	wide and rows at least 64 high in coded CTUs. Smaller dimensions require
+	``--allow-non-conformance`` and do not claim a conforming profile.
+	SVT-HEVC applies its own tile-size validation and does not map
+	``--allow-non-conformance``.
+
+	**Experimental:** multiple tiles require ``--slices 1`` in the x265
+	encoder; the SVT integration also rejects other values.
+	In the x265 encoder, tiles with WPP select a high-throughput profile
+	when conformant, and require a thread pool, at least two CTUs per tile
+	column, and a picture of at least three CTU columns and two CTU rows.
+	Do not specify ``--profile`` with tiles and WPP.
+	Some FFmpeg and libde265 versions do not correctly decode full pictures
+	with both tiles and WPP. Motion-constrained tile slices have decoded
+	correctly after extraction in x265 tests. Loop filtering across tile
+	boundaries is enabled by default for ordinary x265 tiles; see
+	:option:`--loop-filter-across-tiles`.
+	With SVT-HEVC, uniform tile counts, shared slices, one slice per tile and
+	:option:`--mcts` are supported. Non-uniform dimensions and multiple
+	slices per tile or picture are rejected by the x265 SVT integration.
+	SVT-HEVC always disables filtering across tile boundaries, including
+	when the filter option is left at its default, and rejects an explicit
+	request to enable it for multiple tiles or MCTS.
+	With the x265 encoder, zone files, SCC, UHD Blu-ray and multilayer
+	encoding are not supported with multiple tiles.
+
+	With the x265 encoder, rate control and VBV apply to the complete
+	picture, not to individual tiles. For example, ``--bitrate 2000 --vbv-maxrate 2000
+	--vbv-bufsize 4000`` selects a 2000 kbps CBR target with a 4000 kbit
+	buffer; ``--crf 28 --vbv-maxrate 2000 --vbv-bufsize 4000`` selects
+	constrained VBR. Specifying ``--level-idc`` with CRF may implicitly
+	enable VBV. Tiles in a picture share the same GOP decisions; separately
+	encoded streams are not automatically synchronized. Tiles are not
+	motion-constrained unless ``--mcts`` is enabled.
+
+	When using GPAC to split an Annex B CBR stream, use its input option
+	``:keepfiller`` to retain filler NAL units. Splitting or merging
+	rewrites the stream and can change its size; validate the resulting
+	stream's bitrate and HRD constraints separately.
+
+	Some FFmpeg HEVC decoder versions may reconstruct incorrect 4:2:0
+	chroma when SAO and ``--cu-lossless`` are combined.
+	Some libde265 versions may reconstruct incorrect chroma when SAO
+	is used with tile slices.
+
+.. option:: --loop-filter-across-tiles, --no-loop-filter-across-tiles
+
+	Allow deblocking and SAO to use samples across tile boundaries. This
+	does not enable either filter. Enabled by default for ordinary tiles;
+	disabled by default with :option:`--mcts`, which rejects an explicit
+	request to enable it. Cross-slice filtering remains disabled, so tile
+	boundaries that are also slice boundaries are not filtered across.
+	With a single tile, this option has no effect on the bitstream, but an
+	explicit request to enable it is still rejected with MCTS. SVT-HEVC
+	always disables filtering across tile boundaries.
+
+.. option:: --tile-slices, --no-tile-slices
+
+	Encode each tile using independent slices rather than one slice shared
+	across all tiles. Requires multiple tiles, except that single-tile
+	MCTS accepts this option and uses one slice. When enabled, each tile
+	uses one slice by default; :option:`--slices-per-tile` can increase
+	this count with the x265 encoder.
+	Disabled by default, but always enabled for multiple tiles by
+	:option:`--mcts` or when :option:`--slices-per-tile` is greater than
+	one, even if ``--no-tile-slices`` is specified. SVT-HEVC supports only
+	one slice per tile.
+
+.. option:: --slices-per-tile <integer>
+
+	Divide every tile into this many independent, CTU-row-aligned slices.
+	The count must be positive and must not exceed the height in CTU rows
+	of any tile. Values greater than one require multiple tiles and enable
+	tile slices, including with :option:`--mcts`. SVT-HEVC accepts only 1.
+	Default 1.
+
+.. option:: --mcts, --no-mcts
+
+	**Experimental:** constrain inter prediction to each tile, including
+	fractional-sample interpolation. For multiple tiles, automatically
+	enables ``--tile-slices`` and uses the tile restrictions above. Use
+	:option:`--slices-per-tile` for multiple slices in each tile.
+	With one tile, constrains motion at all four coded picture edges and uses
+	one slice. With the x265 encoder, independently encoded pictures can be
+	combined as tiles. Separate encodes must use compatible parameters and
+	synchronized GOPs; interior tile edges must be CTU-aligned. For fixed GOPs, use the
+	same frame count, ``--bframes`` and keyframe settings, and use
+	``--b-adapt 0 --scenecut 0 --no-hist-scenecut --no-fades``.
+	With the x265 encoder, single-tile MCTS with WPP also selects a
+	high-throughput profile; do not specify ``--profile`` in that case.
+	Temporal motion-vector prediction is supported; candidate selection at
+	tile boundaries is restricted to preserve independent tile decoding.
+	Threaded motion estimation is supported; candidates that cannot be
+	used safely fall back to constrained motion estimation.
+	Distributed mode or motion analysis, HME, analysis reuse, multipass
+	refinement and source-reference estimation are not supported. MCTS
+	requires a single non-SCC, non-UHD-BD layer and view. No
+	temporal MCTS SEI is written. Default disabled.
+
+	With SVT-HEVC, this maps to its constrained-motion setting and enables
+	one slice per tile for a multi-tile picture. SVT disables temporal
+	motion-vector prediction in this mode and does not use WPP. The fixed
+	GOP options above apply to x265; SVT supports a different set of GOP
+	options. SVT MCTS tile extraction and merging have not yet been
+	verified by the x265 integration tests.
+
 .. option:: --copy-pic, --no-copy-pic
 
 	Allow encoder to copy input x265 pictures to internal frame buffers. When disabled,
@@ -721,7 +839,8 @@ Profile, Level, Tier
 
 .. option:: --allow-non-conformance, --no-allow-non-conformance
 
-	Allow libx265 to generate a bitstream with profile and level NONE.
+	Allow libx265 to generate a non-conformant bitstream. Depending on the
+	configuration, it may signal profile NONE, level NONE, or both.
 	By default, it will abort any encode which does not meet strict level
 	compliance. The two most likely causes for non-conformance are
 	:option:`--ctu` being too small, :option:`--ref` being too high,
@@ -1314,8 +1433,8 @@ Temporal / motion search options
 .. option:: --temporal-mvp, --no-temporal-mvp
 
 	Enable temporal motion vector predictors in P and B slices.
-	This enables the use of the motion vector from the collocated block
-	in the previous frame to be used as a predictor. Default is enabled
+	This allows a motion vector from a collocated block in a reference
+	picture to be used as a predictor. Default is enabled.
 
 .. option:: --weightp, -w, --no-weightp
 
@@ -1994,6 +2113,7 @@ Quality, rate control and rate distortion options
 	(force QP) or b=<float> (bitrate multiplier).
 
 	If zones overlap, whichever comes later in the list takes precedence.
+	With tiles, zones apply to the whole picture, not to individual tiles.
 	Default none
 	
 	
@@ -2007,6 +2127,8 @@ Quality, rate control and rate distortion options
 	The frame number indicates the beginning of a zone. The options 
 	following this is applied until another zone begins. The reconfigurable 
 	options can be specified as --<feature name> <feature value>
+
+	Zone files are currently unsupported with multiple tiles.
 	
 	**CLI ONLY**
 

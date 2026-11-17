@@ -275,6 +275,8 @@ namespace X265_NS {
         {
             x265_log(NULL, X265_LOG_ERROR, "x265_encoder_open() failed for Enc, \n");
             m_ret = 2;
+            result = 2;
+            delete m_reader;
             m_reader = NULL;
             return -1;
         }
@@ -349,6 +351,11 @@ namespace X265_NS {
 
     void PassEncoder::startThreads()
     {
+        if (m_ret)
+        {
+            m_parent->m_numActiveEncodes.decr();
+            return;
+        }
         /* Start slave worker threads */
         m_threadActive = true;
         start();

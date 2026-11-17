@@ -2374,6 +2374,27 @@ typedef struct x265_param
 
     /*tune*/
     const char* tune;
+
+    /* Uniform HEVC tile grid, in CTUs. A 1x1 grid disables tiles. */
+    int      tileColumns;
+    int      tileRows;
+    /* Encode each tile as an independent slice. */
+    int      bTileSlices;
+    /* Constrain inter prediction to each tile and enable tile slices; does not emit an MCTS SEI. */
+    int      bEnableMcts;
+    /* Explicit tile widths and heights in luma samples. Zero count selects uniform
+     * spacing; at least two values are required otherwise. The encoder may infer
+     * the final tile and reports normalized coded sizes through encoder_parameters. */
+    int      tileColumnWidthCount;
+    int      tileRowHeightCount;
+    int      tileColumnWidths[20];
+    int      tileRowHeights[22];
+    /* Uniform number of independent CTU-row slices in each tile. Default 1. */
+    int      slicesPerTile;
+    /* Set by x265_param_apply_profile when an explicit profile is requested. */
+    int      bExplicitProfile;
+    /* Loop filtering across tile boundaries: -1 auto, 0 disabled, 1 enabled. */
+    int      bLoopFilterAcrossTiles;
 } x265_param;
 
 /* x265_param_alloc:

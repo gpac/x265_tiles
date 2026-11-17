@@ -109,6 +109,7 @@ struct Mode
 
     MotionData bestME[MAX_INTER_PARTS][2];
     MV         amvpCand[2][MAX_NUM_REF][AMVP_NUM_CANDS];
+    int        safeMvpIdx[2][MAX_NUM_REF];
 
     // Neighbour MVs of the current partition. 5 spatial candidates and the
     // temporal candidate.
@@ -348,6 +349,9 @@ public:
     void checkDQPForSplitPred(Mode& mode, const CUGeom& cuGeom);
 
     MV getLowresMV(const CUData& cu, const PredictionUnit& pu, int list, int ref);
+    bool isMctsMvValid(const CUData& cu, const PredictionUnit& pu, const MV& mv) const;
+    int constrainMctsMotion(const CUData& cu, const PredictionUnit& pu, ReferencePlanes* ref,
+                            const MV& mvmin, const MV& mvmax, MV& mv);
 
     /**
      * @brief Run motion estimation for one PU partition shape and persist the best ME result.
@@ -470,8 +474,8 @@ protected:
     };
 
     /* inter/ME helper functions */
-    int       selectMVP(const CUData& cu, const PredictionUnit& pu, const MV amvp[AMVP_NUM_CANDS], int list, int ref);
-    const MV& checkBestMVP(const MV amvpCand[2], const MV& mv, int& mvpIdx, uint32_t& outBits, uint32_t& outCost) const;
+    int       selectMVP(const CUData& cu, const PredictionUnit& pu, const MV amvp[AMVP_NUM_CANDS], int list, int ref, int safeMvpIdx = -1);
+    const MV& checkBestMVP(const MV amvpCand[2], const MV& mv, int& mvpIdx, uint32_t& outBits, uint32_t& outCost, int safeMvpIdx = -1) const;
     void     setSearchRange(const CUData& cu, const MV& mvp, int merange, MV& mvmin, MV& mvmax) const;
     uint32_t mergeEstimation(CUData& cu, const CUGeom& cuGeom, const PredictionUnit& pu, int puIdx, MergeData& m);
     static void getBlkBits(PartSize cuMode, bool bPSlice, int puIdx, uint32_t lastMode, uint32_t blockBit[3]);

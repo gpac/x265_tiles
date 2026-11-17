@@ -77,6 +77,13 @@ x265_encoder *x265_encoder_open(x265_param *p)
     if (!p)
         return NULL;
 
+    const char* svtTileError = x265_svt_tile_error(p);
+    if (svtTileError)
+    {
+        x265_log(p, X265_LOG_ERROR, "%s\n", svtTileError);
+        return NULL;
+    }
+
 #if _MSC_VER
 #pragma warning(disable: 4127) // conditional expression is constant, yes I know
 #endif
@@ -144,6 +151,17 @@ x265_encoder *x265_encoder_open(x265_param *p)
         }
 
         memcpy(encoder->m_svtAppData->svtHevcParams, param->svtHevcParam, sizeof(EB_H265_ENC_CONFIGURATION));
+        if (param->bEnableMcts)
+        {
+            param->bTileSlices = param->tileColumns > 1 || param->tileRows > 1;
+            param->bEnableTemporalMvp = 0;
+            encoder->m_svtAppData->svtHevcParams->unrestrictedMotionVector = 0;
+            x265_log(param, X265_LOG_WARNING, "SVT-HEVC MCTS disables temporal motion-vector prediction\n");
+        }
+        encoder->m_svtAppData->svtHevcParams->tileColumnCount = param->tileColumns;
+        encoder->m_svtAppData->svtHevcParams->tileRowCount = param->tileRows;
+        encoder->m_svtAppData->svtHevcParams->tileSliceMode = param->bTileSlices;
+        param->bLoopFilterAcrossTiles = 0;
 
         // Send over all configuration parameters
         return_error = EbH265EncSetParameter(encoder->m_svtAppData->svtEncoderHandle, encoder->m_svtAppData->svtHevcParams);
@@ -168,6 +186,14 @@ x265_encoder *x265_encoder_open(x265_param *p)
 #endif
 
     x265_setup_primitives(param);
+
+    if (x265_normalize_tile_params(param))
+        goto fail;
+
+    if (param->bEnableMcts && param->tileColumns == 1 && param->tileRows == 1 && param->slicesPerTile == 1)
+        param->bTileSlices = 0;
+    else if (param->bEnableMcts || param->slicesPerTile > 1)
+        param->bTileSlices = 1;
 
     if (x265_check_params(param))
         goto fail;

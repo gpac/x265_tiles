@@ -29,6 +29,7 @@
 #include "cpu.h"
 #include "x265.h"
 #include "svt.h"
+#include <errno.h>
 
 #if _MSC_VER
 #pragma warning(disable: 4996) // POSIX functions are just fine, thanks
@@ -149,6 +150,10 @@ void x265_param_default(x265_param* param)
     param->cpuid = X265_NS::cpu_detect(false);
     param->bEnableWavefront = 1;
     param->frameNumThreads = 0;
+    param->tileColumns = 1;
+    param->tileRows = 1;
+    param->slicesPerTile = 1;
+    param->bLoopFilterAcrossTiles = -1;
 
     param->logLevel = X265_LOG_INFO;
     param->csvLogLevel = 0;
@@ -902,6 +907,34 @@ int x265_zone_param_parse(x265_param* p, const char* name, const char* value)
 #define atof(str) x265_atof(str, bError)
 #define atobool(str) (bNameWasBool = true, x265_atobool(str, bError))
 
+static bool parseTileDimensions(const char* value, int* values, int& count, int limit)
+{
+    int parsed[22];
+    int n = 0;
+    const char* next = value;
+    while (*next)
+    {
+        if (*next < '0' || *next > '9' || n == limit)
+            return false;
+        char* end;
+        errno = 0;
+        long size = strtol(next, &end, 10);
+        if (errno == ERANGE || size <= 0 || size > INT_MAX || (*end && *end != ','))
+            return false;
+        parsed[n++] = (int)size;
+        if (!*end)
+            break;
+        next = end + 1;
+        if (!*next)
+            return false;
+    }
+    if (n < 2)
+        return false;
+    memcpy(values, parsed, n * sizeof(*values));
+    count = n;
+    return true;
+}
+
 int x265_param_parse(x265_param* p, const char* name, const char* value)
 {
     bool bError = false;
@@ -956,7 +989,9 @@ int x265_param_parse(x265_param* p, const char* name, const char* value)
 #define OPT2(STR1, STR2) else if (!strcmp(name, STR1) || !strcmp(name, STR2))
 
 #ifdef SVT_HEVC
-    if (p->bEnableSvtHevc)
+    if (p->bEnableSvtHevc && strcmp(name, "tile-columns") && strcmp(name, "tile-rows") &&
+        strcmp(name, "tile-slices") && strcmp(name, "slices-per-tile") && strcmp(name, "mcts") &&
+        strcmp(name, "loop-filter-across-tiles") && strcmp(name, "slices"))
     {
         if(svt_param_parse(p, name, value))
         {
@@ -1041,6 +1076,30 @@ int x265_param_parse(x265_param* p, const char* name, const char* value)
     OPT("annexb") p->bAnnexB = atobool(value);
     OPT("repeat-headers") p->bRepeatHeaders = atobool(value);
     OPT("wpp") p->bEnableWavefront = atobool(value);
+    OPT("tile-columns")
+    {
+        if (strchr(value, ','))
+            bError = !parseTileDimensions(value, p->tileColumnWidths, p->tileColumnWidthCount, 20);
+        else
+        {
+            p->tileColumns = atoi(value);
+            p->tileColumnWidthCount = 0;
+        }
+    }
+    OPT("tile-rows")
+    {
+        if (strchr(value, ','))
+            bError = !parseTileDimensions(value, p->tileRowHeights, p->tileRowHeightCount, 22);
+        else
+        {
+            p->tileRows = atoi(value);
+            p->tileRowHeightCount = 0;
+        }
+    }
+    OPT("tile-slices") p->bTileSlices = atobool(value);
+    OPT("slices-per-tile") p->slicesPerTile = atoi(value);
+    OPT("mcts") p->bEnableMcts = atobool(value);
+    OPT("loop-filter-across-tiles") p->bLoopFilterAcrossTiles = atobool(value);
     OPT("ctu") p->maxCUSize = (uint32_t)atoi(value);
     OPT("min-cu-size") p->minCUSize = (uint32_t)atoi(value);
     OPT("tu-intra-depth") p->tuQTMaxIntraDepth = (uint32_t)atoi(value);
@@ -1673,6 +1732,107 @@ static inline int _confirm(x265_param* param, bool bflag, const char* message)
     return 1;
 }
 
+static bool normalizeTileDimension(x265_param* param, int* sizes, int& count, int& tiles,
+                                   int extent, int cropOffset, int limit, const char* name)
+{
+    if (!count)
+        return true;
+    if (count < 2 || count > limit || extent <= 0 || cropOffset < 0 ||
+        (int64_t)extent + cropOffset > INT_MAX - param->maxCUSize)
+    {
+        x265_log(param, X265_LOG_ERROR, "%s has an invalid number of dimensions\n", name);
+        return false;
+    }
+    int64_t total = 0;
+    int64_t codedExtent = ((int64_t)extent + cropOffset + param->maxCUSize - 1) / param->maxCUSize * param->maxCUSize;
+    for (int i = 0; i < count; i++)
+    {
+        if (sizes[i] <= 0 || total >= extent)
+        {
+            x265_log(param, X265_LOG_ERROR, "%s contains an empty or fully cropped tile\n", name);
+            return false;
+        }
+        int64_t next = total + sizes[i];
+        if (sizes[i] % param->maxCUSize)
+        {
+            if (i + 1 != count || next != extent)
+            {
+                x265_log(param, X265_LOG_ERROR, "%s boundaries must be CTU-aligned\n", name);
+                return false;
+            }
+            sizes[i] = (int)(codedExtent - total);
+            next = codedExtent;
+        }
+        if (next > codedExtent)
+        {
+            x265_log(param, X265_LOG_ERROR, "%s exceeds the coded picture dimension\n", name);
+            return false;
+        }
+        total = next;
+    }
+    if (total >= extent && total < codedExtent)
+    {
+        sizes[count - 1] += (int)(codedExtent - total);
+        total = codedExtent;
+    }
+    if (total < extent)
+    {
+        if (count == limit)
+        {
+            x265_log(param, X265_LOG_ERROR, "%s leaves no room for an inferred tile\n", name);
+            return false;
+        }
+        sizes[count++] = (int)(codedExtent - total);
+    }
+    tiles = count;
+    return true;
+}
+
+int x265_normalize_tile_params(x265_param* param)
+{
+    if (param->bLoopFilterAcrossTiles < -1 || param->bLoopFilterAcrossTiles > 1)
+    {
+        x265_log(param, X265_LOG_ERROR, "loop-filter-across-tiles must be -1, 0 or 1\n");
+        return -1;
+    }
+    if (param->bLoopFilterAcrossTiles == -1)
+        param->bLoopFilterAcrossTiles = !param->bEnableMcts;
+
+    if (param->maxCUSize != 16 && param->maxCUSize != 32 && param->maxCUSize != 64)
+    {
+        x265_log(param, X265_LOG_ERROR, "CTU size must be 16, 32 or 64\n");
+        return -1;
+    }
+    bool columns = normalizeTileDimension(param, param->tileColumnWidths, param->tileColumnWidthCount,
+                                          param->tileColumns, param->sourceWidth, param->confWinRightOffset, 20, "tile-columns");
+    bool rows = normalizeTileDimension(param, param->tileRowHeights, param->tileRowHeightCount,
+                                       param->tileRows, param->sourceHeight, param->confWinBottomOffset, 22, "tile-rows");
+    return columns && rows ? 0 : -1;
+}
+
+bool x265_tiles_fit_profile(const x265_param* param, bool configured)
+{
+    if (param->tileColumns <= 1 && param->tileRows <= 1)
+        return true;
+    int64_t width = ((int64_t)param->sourceWidth + (configured ? 0 : param->confWinRightOffset) + param->maxCUSize - 1) / param->maxCUSize;
+    int64_t height = ((int64_t)param->sourceHeight + (configured ? 0 : param->confWinBottomOffset) + param->maxCUSize - 1) / param->maxCUSize;
+    for (int i = 0; i < param->tileColumns; i++)
+    {
+        int64_t pixels = param->tileColumnWidthCount ? param->tileColumnWidths[i] :
+            ((i + 1) * width / param->tileColumns - i * width / param->tileColumns) * param->maxCUSize;
+        if (pixels < 256)
+            return false;
+    }
+    for (int i = 0; i < param->tileRows; i++)
+    {
+        int64_t pixels = param->tileRowHeightCount ? param->tileRowHeights[i] :
+            ((i + 1) * height / param->tileRows - i * height / param->tileRows) * param->maxCUSize;
+        if (pixels < 64)
+            return false;
+    }
+    return true;
+}
+
 int x265_check_params(x265_param* param)
 {
 #define CHECK(expr, msg) check_failed |= _confirm(param, expr, msg)
@@ -1689,6 +1849,71 @@ int x265_check_params(x265_param* param)
     uint32_t maxLog2CUSize = (uint32_t)g_log2Size[param->maxCUSize];
     uint32_t tuQTMaxLog2Size = X265_MIN(maxLog2CUSize, 5);
     uint32_t tuQTMinLog2Size = 2; //log2(4)
+
+    CHECK(param->tileColumns < 1 || param->tileColumns > 20 ||
+          param->tileColumns > ((int64_t)param->sourceWidth + param->maxCUSize - 1) / param->maxCUSize,
+          "tile-columns must be between 1 and the number of CTU columns, and at most 20");
+    CHECK(param->tileRows < 1 || param->tileRows > 22 ||
+          param->tileRows > ((int64_t)param->sourceHeight + param->maxCUSize - 1) / param->maxCUSize,
+          "tile-rows must be between 1 and the number of CTU rows, and at most 22");
+    CHECK((int64_t)param->sourceWidth + param->confWinRightOffset > INT_MAX - param->maxCUSize ||
+          (int64_t)param->sourceHeight + param->confWinBottomOffset > INT_MAX - param->maxCUSize,
+          "coded picture dimensions exceed the supported range");
+    if (!check_failed)
+    {
+        CHECK(!param->bAllowNonConformance && !x265_tiles_fit_profile(param),
+              "tile columns must be at least 256 luma samples wide and rows at least 64 high");
+        int64_t codedWidth = ((int64_t)param->sourceWidth + param->confWinRightOffset + param->maxCUSize - 1) / param->maxCUSize;
+        int64_t codedHeight = ((int64_t)param->sourceHeight + param->confWinBottomOffset + param->maxCUSize - 1) / param->maxCUSize;
+        CHECK(!param->tileColumnWidthCount && (param->tileColumns - 1) * codedWidth / param->tileColumns * param->maxCUSize >= param->sourceWidth,
+              "the last tile column is fully cropped");
+        CHECK(!param->tileRowHeightCount && (param->tileRows - 1) * codedHeight / param->tileRows * param->maxCUSize >= param->sourceHeight,
+              "the last tile row is fully cropped");
+    }
+    CHECK(param->bTileSlices && param->tileColumns == 1 && param->tileRows == 1,
+          "tile-slices requires more than one tile");
+    CHECK(param->slicesPerTile < 1, "slices-per-tile must be positive");
+    if (!check_failed && param->slicesPerTile > 1)
+    {
+        int64_t height = ((int64_t)param->sourceHeight + param->confWinBottomOffset + param->maxCUSize - 1) / param->maxCUSize;
+        for (int i = 0; i < param->tileRows; i++)
+        {
+            int64_t rows = param->tileRowHeightCount ? param->tileRowHeights[i] / param->maxCUSize :
+                (i + 1) * height / param->tileRows - i * height / param->tileRows;
+            CHECK(param->slicesPerTile > rows, "slices-per-tile exceeds a tile's CTU row count");
+        }
+    }
+    if (param->bEnableMcts)
+    {
+        CHECK(param->bLoopFilterAcrossTiles, "mcts requires --no-loop-filter-across-tiles");
+        CHECK(param->bDistributeMotionEstimation || param->bDistributeModeAnalysis ||
+              param->bEnableHME || strlen(param->analysisLoad) || param->analysisLoadReuseLevel > 1 || param->analysisMultiPassRefine ||
+              param->bAnalysisType || param->bSourceReferenceEstimation,
+              "mcts does not support distributed analysis, HME, analysis reuse or source reference estimation");
+        CHECK(param->maxSlices != 1, "mcts requires --slices 1");
+        CHECK(param->bEnableWavefront && param->bExplicitProfile,
+              "mcts with WPP requires the automatically selected high-throughput profile");
+        CHECK(param->bEnableSCC || param->numLayers > 1 || param->numViews > 1 || param->uhdBluray,
+              "mcts currently requires a single non-SCC, non-UHD-BD layer and view");
+    }
+    if (param->tileColumns > 1 || param->tileRows > 1)
+    {
+        CHECK(param->maxSlices != 1, "tiles currently require --slices 1");
+        if (!check_failed && param->bEnableWavefront)
+        {
+            CHECK(param->bExplicitProfile, "tiles with WPP require the automatically selected high-throughput profile");
+            int64_t width = ((int64_t)param->sourceWidth + param->confWinRightOffset + param->maxCUSize - 1) / param->maxCUSize;
+            for (int i = 0; i < param->tileColumns; i++)
+            {
+                int64_t columns = param->tileColumnWidthCount ? param->tileColumnWidths[i] / param->maxCUSize :
+                    (i + 1) * width / param->tileColumns - i * width / param->tileColumns;
+                CHECK(columns < 2, "WPP requires each tile column to contain at least two CTUs");
+            }
+        }
+        CHECK(param->bEnableSCC || param->numLayers > 1 || param->uhdBluray,
+              "tiles currently require a single non-SCC, non-UHD-BD layer");
+        CHECK(param->rc.zonefileCount, "tiles currently do not support zonefile reconfiguration");
+    }
 
     CHECK((param->maxSlices > 1) && !param->bEnableWavefront,
         "Multiple-Slices mode must be enable Wavefront Parallel Processing (--wpp)");
@@ -2202,6 +2427,11 @@ void x265_print_params(x265_param* param)
     TOOLOPT(param->bDynamicRefine, "dynamic-refine");
     if (param->maxSlices > 1)
         TOOLVAL(param->maxSlices, "slices=%d");
+    if (param->tileColumns > 1 || param->tileRows > 1)
+    {
+        TOOLVAL(param->tileColumns, "tile-columns=%d");
+        TOOLVAL(param->tileRows, "tile-rows=%d");
+    }
     if (param->bEnableLoopFilter)
     {
         if (param->deblockingFilterBetaOffset || param->deblockingFilterTCOffset)
@@ -2237,7 +2467,8 @@ void x265_print_params(x265_param* param)
 char *x265_param2string(x265_param* p, int padx, int pady)
 {
     char *buf, *s;
-    size_t bufSize = 4000 + p->rc.zoneCount * 64;
+    size_t bufSize = 4000 + p->rc.zoneCount * 64 +
+                     (p->tileColumnWidthCount + p->tileRowHeightCount) * 12;
     if (strlen(p->numaPools))
         bufSize += strlen(p->numaPools);
     if (strlen(p->masteringDisplayColorVolume))
@@ -2448,6 +2679,28 @@ char *x265_param2string(x265_param* p, int padx, int pady)
     BOOL(p->bEmitVUITimingInfo, "vui-timing-info");
     BOOL(p->bEmitVUIHRDInfo, "vui-hrd-info");
     s += snprintf(s, bufSize - (s - buf), " slices=%d", p->maxSlices);
+    if (p->tileColumns > 1 || p->tileRows > 1)
+    {
+        s += snprintf(s, bufSize - (s - buf), " tile-columns=");
+        if (p->tileColumnWidthCount)
+            for (int i = 0; i < p->tileColumnWidthCount; i++)
+                s += snprintf(s, bufSize - (s - buf), "%s%d", i ? "," : "", p->tileColumnWidths[i]);
+        else
+            s += snprintf(s, bufSize - (s - buf), "%d", p->tileColumns);
+        s += snprintf(s, bufSize - (s - buf), " tile-rows=");
+        if (p->tileRowHeightCount)
+            for (int i = 0; i < p->tileRowHeightCount; i++)
+                s += snprintf(s, bufSize - (s - buf), "%s%d", i ? "," : "", p->tileRowHeights[i]);
+        else
+            s += snprintf(s, bufSize - (s - buf), "%d", p->tileRows);
+    }
+    if (p->bTileSlices)
+        BOOL(p->bTileSlices, "tile-slices");
+    if (p->slicesPerTile > 1)
+        s += snprintf(s, bufSize - (s - buf), " slices-per-tile=%d", p->slicesPerTile);
+    if (p->bEnableMcts)
+        BOOL(p->bEnableMcts, "mcts");
+    BOOL(p->bLoopFilterAcrossTiles, "loop-filter-across-tiles");
     BOOL(p->bOptQpPPS, "opt-qp-pps");
     BOOL(p->bOptRefListLengthPPS, "opt-ref-list-length-pps");
     BOOL(p->bMultiPassOptRPS, "multi-pass-opt-rps");
@@ -2945,6 +3198,17 @@ void x265_copy_params(x265_param* dst, x265_param* src)
     dst->bEmitVUIHRDInfo = src->bEmitVUIHRDInfo;
     dst->bEmitVUITimingInfo = src->bEmitVUITimingInfo;
     dst->maxSlices = src->maxSlices;
+    dst->tileColumns = src->tileColumns;
+    dst->tileRows = src->tileRows;
+    dst->slicesPerTile = src->slicesPerTile;
+    dst->bExplicitProfile = src->bExplicitProfile;
+    dst->bLoopFilterAcrossTiles = src->bLoopFilterAcrossTiles;
+    dst->tileColumnWidthCount = src->tileColumnWidthCount;
+    dst->tileRowHeightCount = src->tileRowHeightCount;
+    memcpy(dst->tileColumnWidths, src->tileColumnWidths, sizeof(dst->tileColumnWidths));
+    memcpy(dst->tileRowHeights, src->tileRowHeights, sizeof(dst->tileRowHeights));
+    dst->bTileSlices = src->bTileSlices;
+    dst->bEnableMcts = src->bEnableMcts;
     dst->bOptQpPPS = src->bOptQpPPS;
     dst->bOptRefListLengthPPS = src->bOptRefListLengthPPS;
     dst->bMultiPassOptRPS = src->bMultiPassOptRPS;

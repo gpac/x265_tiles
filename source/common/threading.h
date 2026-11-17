@@ -761,8 +761,12 @@ public:
             free(m_sem);
             m_sem = NULL;
 #else //__APPLE__
+#ifdef __EMSCRIPTEN_PTHREADS__
+            sem_destroy(m_sem);
+#else
             sem_close(m_sem);
             sem_unlink(m_name);
+#endif
             m_sem = NULL;
             free(m_name);
             m_name = NULL;

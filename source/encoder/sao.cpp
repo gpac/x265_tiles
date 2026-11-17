@@ -56,6 +56,24 @@ inline int64_t estSaoDist(int32_t count, int32_t offset, int32_t offsetOrg)
 
 namespace X265_NS {
 
+struct SaoCtuBoundary
+{
+    bool left, right, above, below;
+
+    SaoCtuBoundary(const CUData& cu, bool filtering = true)
+    {
+        TileLayout tiles(*cu.m_slice->m_sps, *cu.m_slice->m_pps);
+        uint32_t col = cu.m_cuAddr % tiles.width;
+        uint32_t row = cu.m_cuAddr / tiles.width;
+        uint32_t tile = tiles.id(col, row);
+        bool acrossTiles = filtering && cu.m_slice->m_pps->bLoopFilterAcrossTiles && !cu.m_slice->m_param->bTileSlices;
+        left = !col || (!acrossTiles && tiles.id(col - 1, row) != tile);
+        right = col + 1 == tiles.width || (!acrossTiles && tiles.id(col + 1, row) != tile);
+        above = !row || cu.m_bFirstRowInSlice || (!acrossTiles && tiles.id(col, row - 1) != tile);
+        below = row + 1 == tiles.height || cu.m_bLastRowInSlice || (!acrossTiles && tiles.id(col, row + 1) != tile);
+    }
+};
+
 const uint32_t SAO::s_eoTable[NUM_EDGETYPE] =
 {
     1, // 0
@@ -277,9 +295,9 @@ void SAO::applyPixelOffsets(int addr, int typeIdx, int plane)
     int ctuHeight = m_param->maxCUSize;
     uint32_t lpelx = cu->m_cuPelX;
     uint32_t tpely = cu->m_cuPelY;
-    const uint32_t firstRowInSlice = cu->m_bFirstRowInSlice;
+    const SaoCtuBoundary boundary(*cu);
     const uint32_t lastRowInSlice = cu->m_bLastRowInSlice;
-    const uint32_t bAboveUnavail = (!tpely) | firstRowInSlice;
+    const uint32_t bAboveUnavail = boundary.above;
 
     // NOTE: Careful! the picHeight for Equal operator only, so I may safe to hack it
     if (lastRowInSlice)
@@ -316,8 +334,8 @@ void SAO::applyPixelOffsets(int addr, int typeIdx, int plane)
     case SAO_EO_0: // dir: -
     {
         pixel firstPxl = 0, lastPxl = 0, row1FirstPxl = 0, row1LastPxl = 0;
-        int startX = !lpelx;
-        int endX   = (rpelx == picWidth) ? ctuWidth - 1 : ctuWidth;
+        int startX = boundary.left;
+        int endX   = boundary.right ? ctuWidth - 1 : ctuWidth;
         if (ctuWidth & 15)
         {
             for (int y = 0; y < ctuHeight; y++, rec += stride)
@@ -340,13 +358,13 @@ void SAO::applyPixelOffsets(int addr, int typeIdx, int plane)
                 signLeft1[0] = x265_signOf(rec[startX] - tmpL[y]);
                 signLeft1[1] = x265_signOf(rec[stride + startX] - tmpL[y + 1]);
 
-                if (!lpelx)
+                if (boundary.left)
                 {
                     firstPxl = rec[0];
                     row1FirstPxl = rec[stride];
                 }
 
-                if (rpelx == picWidth)
+                if (boundary.right)
                 {
                     lastPxl = rec[ctuWidth - 1];
                     row1LastPxl = rec[stride + ctuWidth - 1];
@@ -354,13 +372,13 @@ void SAO::applyPixelOffsets(int addr, int typeIdx, int plane)
 
                 primitives.saoCuOrgE0(rec, offsetEo, ctuWidth, signLeft1, stride);
 
-                if (!lpelx)
+                if (boundary.left)
                 {
                     rec[0] = firstPxl;
                     rec[stride] = row1FirstPxl;
                 }
 
-                if (rpelx == picWidth)
+                if (boundary.right)
                 {
                     rec[ctuWidth - 1] = lastPxl;
                     rec[stride + ctuWidth - 1] = row1LastPxl;
@@ -372,7 +390,7 @@ void SAO::applyPixelOffsets(int addr, int typeIdx, int plane)
     case SAO_EO_1: // dir: |
     {
         int startY = bAboveUnavail;
-        int endY   = (bpely == picHeight) ? ctuHeight - 1 : ctuHeight;
+        int endY   = boundary.below ? ctuHeight - 1 : ctuHeight;
         if (startY)
             rec += stride;
 
@@ -409,11 +427,11 @@ void SAO::applyPixelOffsets(int addr, int typeIdx, int plane)
     }
     case SAO_EO_2: // dir: 135
     {
-        int startX = !lpelx;
-        int endX   = (rpelx == picWidth) ? ctuWidth - 1 : ctuWidth;
+        int startX = boundary.left;
+        int endX   = boundary.right ? ctuWidth - 1 : ctuWidth;
 
         int startY = bAboveUnavail;
-        int endY   = (bpely == picHeight) ? ctuHeight - 1 : ctuHeight;
+        int endY   = boundary.below ? ctuHeight - 1 : ctuHeight;
 
         if (startY)
             rec += stride;
@@ -422,18 +440,18 @@ void SAO::applyPixelOffsets(int addr, int typeIdx, int plane)
         {
             int8_t firstSign, lastSign;
 
-            if (!lpelx)
+            if (boundary.left)
                 firstSign = upBuff1[0];
 
-            if (rpelx == picWidth)
+            if (boundary.right)
                 lastSign = upBuff1[ctuWidth - 1];
 
             primitives.sign(upBuff1, rec, &tmpU[- 1], ctuWidth);
 
-            if (!lpelx)
+            if (boundary.left)
                 upBuff1[0] = firstSign;
 
-            if (rpelx == picWidth)
+            if (boundary.right)
                 upBuff1[ctuWidth - 1] = lastSign;
         }
         else
@@ -475,11 +493,11 @@ void SAO::applyPixelOffsets(int addr, int typeIdx, int plane)
     }
     case SAO_EO_3: // dir: 45
     {
-        int startX = !lpelx;
-        int endX   = (rpelx == picWidth) ? ctuWidth - 1 : ctuWidth;
+        int startX = boundary.left;
+        int endX   = boundary.right ? ctuWidth - 1 : ctuWidth;
 
         int startY = bAboveUnavail;
-        int endY   = (bpely == picHeight) ? ctuHeight - 1 : ctuHeight;
+        int endY   = boundary.below ? ctuHeight - 1 : ctuHeight;
 
         if (startY)
             rec += stride;
@@ -512,16 +530,16 @@ void SAO::applyPixelOffsets(int addr, int typeIdx, int plane)
         {
             int8_t firstSign, lastSign;
 
-            if (lpelx)
+            if (!boundary.left)
                 firstSign = x265_signOf(rec[-1] - tmpU[0]);
-            if (rpelx == picWidth)
+            if (boundary.right)
                 lastSign = upBuff1[ctuWidth - 1];
 
             primitives.sign(upBuff1, rec, &tmpU[1], ctuWidth);
 
-            if (lpelx)
+            if (!boundary.left)
                 upBuff1[-1] = firstSign;
-            if (rpelx == picWidth)
+            if (boundary.right)
                 upBuff1[ctuWidth - 1] = lastSign;
 
             for (int y = startY; y < endY; y++, rec += stride)
@@ -573,7 +591,7 @@ void SAO::generateLumaOffsets(SaoCtuParam* ctuParam, int idxY, int idxX)
     int addr = idxY * m_numCuInWidth + idxX;
     pixel* rec = reconPic->getLumaAddr(addr);
 
-    if (idxX == 0)
+    if (SaoCtuBoundary(*m_frame->m_encData->getPicCTU(addr)).left)
     {
         for (int i = 0; i < ctuHeight + 1; i++)
         {
@@ -639,7 +657,7 @@ void SAO::generateChromaOffsets(SaoCtuParam* ctuParam[3], int idxY, int idxX)
     pixel* recCb = reconPic->getCbAddr(addr);
     pixel* recCr = reconPic->getCrAddr(addr);
 
-    if (idxX == 0)
+    if (SaoCtuBoundary(*m_frame->m_encData->getPicCTU(addr)).left)
     {
         for (int i = 0; i < ctuHeight + 1; i++)
         {
@@ -741,9 +759,9 @@ void SAO::calcSaoStatsCTU(int addr, int plane)
     int ctuHeight = m_param->maxCUSize;
     uint32_t lpelx = cu->m_cuPelX;
     uint32_t tpely = cu->m_cuPelY;
-    const uint32_t firstRowInSlice = cu->m_bFirstRowInSlice;
+    const SaoCtuBoundary boundary(*cu);
     const uint32_t lastRowInSlice = cu->m_bLastRowInSlice;
-    const uint32_t bAboveUnavail = (!tpely) | firstRowInSlice;
+    const uint32_t bAboveUnavail = boundary.above;
 
     if (plane)
     {
@@ -808,8 +826,8 @@ void SAO::calcSaoStatsCTU(int addr, int plane)
             skipR = 4;
         }
 
-        endX = (rpelx == picWidth) ? ctuWidth : ctuWidth - skipR + plane_offset;
-        endY = (bpely == picHeight) ? ctuHeight : ctuHeight - skipB + plane_offset;
+        endX = boundary.right ? ctuWidth : ctuWidth - skipR + plane_offset;
+        endY = boundary.below ? ctuHeight : ctuHeight - skipB + plane_offset;
 
         primitives.saoCuStatsBO(diff, rec0, stride, endX, endY, m_offsetOrg[plane][SAO_BO], m_count[plane][SAO_BO]);
     }
@@ -823,8 +841,8 @@ void SAO::calcSaoStatsCTU(int addr, int plane)
                 skipR = 5;
             }
 
-            startX = !lpelx;
-            endX   = (rpelx == picWidth) ? ctuWidth - 1 : ctuWidth - skipR + plane_offset;
+            startX = boundary.left;
+            endX   = boundary.right ? ctuWidth - 1 : ctuWidth - skipR + plane_offset;
 
             primitives.saoCuStatsE0(diff + startX, rec0 + startX, stride, endX - startX, ctuHeight - skipB + plane_offset, m_offsetOrg[plane][SAO_EO_0], m_count[plane][SAO_EO_0]);
         }
@@ -840,8 +858,8 @@ void SAO::calcSaoStatsCTU(int addr, int plane)
             rec  = rec0;
 
             startY = bAboveUnavail;
-            endX   = (rpelx == picWidth) ? ctuWidth : ctuWidth - skipR + plane_offset;
-            endY   = (bpely == picHeight) ? ctuHeight - 1 : ctuHeight - skipB + plane_offset;
+            endX   = boundary.right ? ctuWidth : ctuWidth - skipR + plane_offset;
+            endY   = boundary.below ? ctuHeight - 1 : ctuHeight - skipB + plane_offset;
             if (startY)
             {
                 rec += stride;
@@ -864,11 +882,11 @@ void SAO::calcSaoStatsCTU(int addr, int plane)
 
                 rec  = rec0;
 
-                startX = !lpelx;
-                endX   = (rpelx == picWidth) ? ctuWidth - 1 : ctuWidth - skipR + plane_offset;
+                startX = boundary.left;
+                endX   = boundary.right ? ctuWidth - 1 : ctuWidth - skipR + plane_offset;
 
                 startY = bAboveUnavail;
-                endY   = (bpely == picHeight) ? ctuHeight - 1 : ctuHeight - skipB + plane_offset;
+                endY   = boundary.below ? ctuHeight - 1 : ctuHeight - skipB + plane_offset;
                 if (startY)
                 {
                     rec += stride;
@@ -886,11 +904,11 @@ void SAO::calcSaoStatsCTU(int addr, int plane)
                     skipR = 5;
                 }
                 rec  = rec0;
-                startX = !lpelx;
-                endX   = (rpelx == picWidth) ? ctuWidth - 1 : ctuWidth - skipR + plane_offset;
+                startX = boundary.left;
+                endX   = boundary.right ? ctuWidth - 1 : ctuWidth - skipR + plane_offset;
 
                 startY = bAboveUnavail;
-                endY   = (bpely == picHeight) ? ctuHeight - 1 : ctuHeight - skipB + plane_offset;
+                endY   = boundary.below ? ctuHeight - 1 : ctuHeight - skipB + plane_offset;
 
                 if (startY)
                 {
@@ -921,9 +939,9 @@ void SAO::calcSaoStatsCu_BeforeDblk(Frame* frame, int idxX, int idxY)
     int ctuHeight = m_param->maxCUSize;
     uint32_t lpelx = cu->m_cuPelX;
     uint32_t tpely = cu->m_cuPelY;
-    const uint32_t firstRowInSlice = cu->m_bFirstRowInSlice;
+    const SaoCtuBoundary boundary(*cu);
     const uint32_t lastRowInSlice = cu->m_bLastRowInSlice;
-    const uint32_t bAboveAvail = (!tpely) | firstRowInSlice;
+    const uint32_t bAboveAvail = boundary.above;
 
     // NOTE: Careful! the picHeight for Equal operator only, so I may safe to hack it
     if (lastRowInSlice)
@@ -983,8 +1001,8 @@ void SAO::calcSaoStatsCu_BeforeDblk(Frame* frame, int idxX, int idxY)
         fenc = fenc0;
         rec  = rec0;
 
-        startX = (rpelx == picWidth) ? ctuWidth : ctuWidth - skipR;
-        startY = (bpely == picHeight) ? ctuHeight : ctuHeight - skipB;
+        startX = boundary.right ? ctuWidth : ctuWidth - skipR;
+        startY = boundary.below ? ctuHeight : ctuHeight - skipB;
 
         for (y = 0; y < ctuHeight; y++)
         {
@@ -1010,9 +1028,9 @@ void SAO::calcSaoStatsCu_BeforeDblk(Frame* frame, int idxX, int idxY)
             fenc = fenc0;
             rec  = rec0;
 
-            startX = (rpelx == picWidth) ? ctuWidth - 1 : ctuWidth - skipR;
-            startY = (bpely == picHeight) ? ctuHeight : ctuHeight - skipB;
-            firstX = !lpelx;
+            startX = boundary.right ? ctuWidth - 1 : ctuWidth - skipR;
+            startY = boundary.below ? ctuHeight : ctuHeight - skipB;
+            firstX = boundary.left;
             // endX   = (rpelx == picWidth) ? ctuWidth - 1 : ctuWidth;
             endX   = ctuWidth - 1;  // not refer right CTU
 
@@ -1046,8 +1064,8 @@ void SAO::calcSaoStatsCu_BeforeDblk(Frame* frame, int idxX, int idxY)
             fenc = fenc0;
             rec  = rec0;
 
-            startX = (rpelx == picWidth) ? ctuWidth : ctuWidth - skipR;
-            startY = (bpely == picHeight) ? ctuHeight - 1 : ctuHeight - skipB;
+            startX = boundary.right ? ctuWidth : ctuWidth - skipR;
+            startY = boundary.below ? ctuHeight - 1 : ctuHeight - skipB;
             firstY = bAboveAvail;
             // endY   = (bpely == picHeight) ? ctuHeight - 1 : ctuHeight;
             endY   = ctuHeight - 1; // not refer below CTU
@@ -1091,9 +1109,9 @@ void SAO::calcSaoStatsCu_BeforeDblk(Frame* frame, int idxX, int idxY)
             fenc = fenc0;
             rec  = rec0;
 
-            startX = (rpelx == picWidth) ? ctuWidth - 1 : ctuWidth - skipR;
-            startY = (bpely == picHeight) ? ctuHeight - 1 : ctuHeight - skipB;
-            firstX = !lpelx;
+            startX = boundary.right ? ctuWidth - 1 : ctuWidth - skipR;
+            startY = boundary.below ? ctuHeight - 1 : ctuHeight - skipB;
+            firstX = boundary.left;
             firstY = bAboveAvail;
             // endX   = (rpelx == picWidth) ? ctuWidth - 1 : ctuWidth;
             // endY   = (bpely == picHeight) ? ctuHeight - 1 : ctuHeight;
@@ -1143,9 +1161,9 @@ void SAO::calcSaoStatsCu_BeforeDblk(Frame* frame, int idxX, int idxY)
             fenc = fenc0;
             rec  = rec0;
 
-            startX = (rpelx == picWidth) ? ctuWidth - 1 : ctuWidth - skipR;
-            startY = (bpely == picHeight) ? ctuHeight - 1 : ctuHeight - skipB;
-            firstX = !lpelx;
+            startX = boundary.right ? ctuWidth - 1 : ctuWidth - skipR;
+            startY = boundary.below ? ctuHeight - 1 : ctuHeight - skipB;
+            firstX = boundary.left;
             firstY = bAboveAvail;
             // endX   = (rpelx == picWidth) ? ctuWidth - 1 : ctuWidth;
             // endY   = (bpely == picHeight) ? ctuHeight - 1 : ctuHeight;
@@ -1226,7 +1244,10 @@ void SAO::rdoSaoUnitCu(SAOParam* saoParam, int rowBaseAddr, int idxX, int addr)
     lambda[0] = (int64_t)floor(256.0 * x265_lambda2_tab[qp]);
     lambda[1] = (int64_t)floor(256.0 * x265_lambda2_tab[qpCb]); // Use Cb QP for SAO chroma
 
-    const bool allowMerge[2] = {(idxX != 0), (rowBaseAddr != 0)}; // left, up
+    const SaoCtuBoundary boundary(*cu, false);
+    const bool allowMerge[2] = {!boundary.left, !boundary.above}; // left, up
+    if (boundary.left && slice->m_pps->tileColumns > 1)
+        m_rdContexts.cur.load(m_rdContexts.next);
 
     const int addrMerge[2] = {(idxX ? addr - 1 : -1), (rowBaseAddr ? addr - m_numCuInWidth : -1)};// left, up
 

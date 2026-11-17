@@ -36,15 +36,19 @@ class NALList
 {
 public:
 #if ENABLE_MULTIVIEW || ENABLE_ALPHA
-    static const int MAX_NAL_UNITS = 32;
+    static const int MAX_LEGACY_NAL_UNITS = 32;
 #else
-    static const int MAX_NAL_UNITS = 16;
+    static const int MAX_LEGACY_NAL_UNITS = 16;
 #endif
+    static const int INITIAL_NAL_CAPACITY = 512;
 
 public:
 
-    x265_nal    m_nal[MAX_NAL_UNITS];
+    x265_nal    m_nalStorage[INITIAL_NAL_CAPACITY];
+    x265_nal*   m_nal;
     uint32_t    m_numNal;
+    uint32_t    m_nalCapacity;
+    bool        m_failed;
 
     uint8_t*    m_buffer;
     uint32_t    m_occupancy;
@@ -56,13 +60,18 @@ public:
     bool        m_annexB;
 
     NALList();
-    ~NALList() { X265_FREE(m_buffer); X265_FREE(m_extraBuffer); }
+    ~NALList() { if (m_nal != m_nalStorage) X265_FREE(m_nal); X265_FREE(m_buffer); X265_FREE(m_extraBuffer); }
 
     void takeContents(NALList& other);
+    bool reserveNalUnits(uint32_t count);
 
     void serialize(NalUnitType nalUnitType, const Bitstream& bs, int layerId = 0, uint8_t temporalID = 1);
 
     uint32_t serializeSubstreams(uint32_t* streamSizeBytes, uint32_t streamCount, const Bitstream* streams);
+
+private:
+    NALList(const NALList&);
+    NALList& operator=(const NALList&);
 };
 
 }

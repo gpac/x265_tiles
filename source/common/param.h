@@ -27,7 +27,30 @@
 
 namespace X265_NS {
 
+static inline const char* x265_svt_tile_error(const x265_param* param)
+{
+    if (!param->bEnableSvtHevc)
+        return NULL;
+    if (param->tileColumnWidthCount || param->tileRowHeightCount)
+        return "SVT-HEVC integration does not support non-uniform tiles";
+    if (param->tileColumns < 1 || param->tileColumns > 20 || param->tileRows < 1 || param->tileRows > 22)
+        return "SVT-HEVC tile counts must be between 1 and 20 columns and 1 and 22 rows";
+    if (param->slicesPerTile != 1 || param->maxSlices != 1)
+        return "SVT-HEVC integration does not support multiple slices per tile or picture";
+    if (param->bTileSlices < 0 || param->bTileSlices > 1 ||
+        (param->bTileSlices && !param->bEnableMcts && param->tileColumns == 1 && param->tileRows == 1))
+        return "SVT-HEVC tile slices require multiple tiles";
+    if (param->bLoopFilterAcrossTiles < -1 || param->bLoopFilterAcrossTiles > 1)
+        return "loop-filter-across-tiles must be -1, 0 or 1";
+    if (param->bLoopFilterAcrossTiles == 1 &&
+        (param->bEnableMcts || param->tileColumns > 1 || param->tileRows > 1))
+        return "SVT-HEVC does not support loop filtering across tile boundaries";
+    return NULL;
+}
+
 int   x265_check_params(x265_param *param);
+int   x265_normalize_tile_params(x265_param *param);
+bool  x265_tiles_fit_profile(const x265_param *param, bool configured = false);
 void  x265_print_params(x265_param *param);
 void  x265_param_apply_fastfirstpass(x265_param *p);
 char* x265_param2string(x265_param *param, int padx, int pady);

@@ -29,7 +29,10 @@
 using namespace X265_NS;
 
 NALList::NALList()
-    : m_numNal(0)
+    : m_nal(m_nalStorage)
+    , m_numNal(0)
+    , m_nalCapacity(INITIAL_NAL_CAPACITY)
+    , m_failed(false)
     , m_buffer(NULL)
     , m_occupancy(0)
     , m_allocSize(0)
@@ -39,8 +42,51 @@ NALList::NALList()
     , m_annexB(true)
 {}
 
+bool NALList::reserveNalUnits(uint32_t count)
+{
+    if (m_failed)
+        return false;
+    if (count <= m_nalCapacity)
+        return true;
+
+    uint32_t capacity = m_nalCapacity;
+    while (capacity < count)
+    {
+        if (capacity > UINT32_MAX / 2)
+        {
+            capacity = count;
+            break;
+        }
+        capacity *= 2;
+    }
+    if ((size_t)capacity > SIZE_MAX / sizeof(x265_nal))
+    {
+        x265_log(NULL, X265_LOG_ERROR, "NAL list size overflow\n");
+        m_failed = true;
+        return false;
+    }
+    x265_nal* nal = X265_MALLOC(x265_nal, capacity);
+    if (!nal)
+    {
+        x265_log(NULL, X265_LOG_ERROR, "Unable to allocate NAL list\n");
+        m_failed = true;
+        return false;
+    }
+    memcpy(nal, m_nal, sizeof(x265_nal) * m_numNal);
+    if (m_nal != m_nalStorage)
+        X265_FREE(m_nal);
+    m_nal = nal;
+    m_nalCapacity = capacity;
+    return true;
+}
+
 void NALList::takeContents(NALList& other)
 {
+    if (other.m_failed || !reserveNalUnits(other.m_numNal))
+    {
+        m_failed = true;
+        return;
+    }
     /* take other NAL buffer, discard our old one */
     X265_FREE(m_buffer);
     m_buffer = other.m_buffer;
@@ -61,6 +107,13 @@ void NALList::serialize(NalUnitType nalUnitType, const Bitstream& bs, int layerI
 {
     static const char startCodePrefix[] = { 0, 0, 0, 1 };
 
+    if (m_numNal == UINT32_MAX || !reserveNalUnits(m_numNal + 1))
+    {
+        if (!m_failed)
+            x265_log(NULL, X265_LOG_ERROR, "NAL count overflow\n");
+        m_failed = true;
+        return;
+    }
     uint32_t payloadSize = bs.getNumberOfWrittenBytes();
     const uint8_t* bpayload = bs.getFIFO();
     if (!bpayload)
@@ -162,8 +215,6 @@ void NALList::serialize(NalUnitType nalUnitType, const Bitstream& bs, int layerI
     }
 
     m_occupancy += bytes;
-
-    X265_CHECK(m_numNal < (uint32_t)MAX_NAL_UNITS, "NAL count overflow\n");
 
     x265_nal& nal = m_nal[m_numNal++];
     nal.type = nalUnitType;

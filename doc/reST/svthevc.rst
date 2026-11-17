@@ -4,13 +4,12 @@ SVT-HEVC
 .. _SvtHevc:
 
 x265 has support for open source HEVC encoder `SVT-HEVC <https://www.intel.com/content/www/us/en/developer/articles/technical/scalable-video-technology.html>`_
-and can generate SVT-HEVC compliant bitstreams. SVT-HEVC encoder can be enabled at run time 
-using :option:`--svt`. Since SVT-HEVC params/CLI are not exposed outside, it has to be 
-configured only via x265 CLI options. The API's of SVT-HEVC are accessed through x265's API 
-so even library users of x265 can avail this feature, under the condition that x265_param_parse() 
-API should be used for all param assignment. Params assigned outside of x265_param_parse() API 
-wont't be mapped to SVT-HEVC. This document describes the steps needed to compile x265 
-with SVT-HEVC and CLI options mapping between x265 and SVT-HEVC.
+and can generate SVT-HEVC compliant bitstreams. Enable SVT-HEVC at run time
+using :option:`--svt`. It can be configured through the x265 CLI and API.
+Use x265_param_parse() for parameter assignment: most fields assigned directly
+are not mapped to SVT-HEVC. The tile-related x265_param fields described below
+are also read directly when opening the encoder. This document describes the
+build steps and the CLI option mapping.
 
 Supported Version
 =================
@@ -60,6 +59,14 @@ SVT-HEVC encoder options (Name as shown in SVT-HEVC's sample configuration file)
 |                                           | FrameRateDenominator         | Any Positive Integer         |
 +-------------------------------------------+------------------------------+------------------------------+
 | :option:`--profile`                       | Profile                      | [main, main10]               |
++-------------------------------------------+------------------------------+------------------------------+
+| :option:`--tile-columns`                  | TileColumnCount              | Uniform count [1 - 20]       |
++-------------------------------------------+------------------------------+------------------------------+
+| :option:`--tile-rows`                     | TileRowCount                 | Uniform count [1 - 22]       |
++-------------------------------------------+------------------------------+------------------------------+
+| :option:`--tile-slices`                   | TileSliceMode                | [0, 1]                       |
++-------------------------------------------+------------------------------+------------------------------+
+| :option:`--mcts`                          | UnrestrictedMotionVector     | 0 when enabled               |
 +-------------------------------------------+------------------------------+------------------------------+
 | :option:`--level-idc`                     | Level                        | [1, 2, 2.1, 3, 3.1, 4, 4.1,  |
 |                                           |                              |  5, 5.1, 5.2, 6, 6.1, 6.2]   |
@@ -144,9 +151,16 @@ SVT-HEVC encoder options (Name as shown in SVT-HEVC's sample configuration file)
 | :option:`--svt-fps-in-vps`                | FpsInVps                     |                              |
 +-------------------------------------------+------------------------------+------------------------------+
 
-x265 CLI options which are not present in the above table will have no effect if SVT-HEVC is enabled 
-and would be ignored silently with a warning. If SVT-HEVC is enabled, accepted input range of x265 CLI 
-options will change, because it follows SVT-HEVC encoder's specs, which are mentioned in the Range 
+With SVT-HEVC, ``--mcts`` also enables one slice per tile for a multi-tile
+picture and disables temporal motion-vector prediction. SVT-HEVC always
+disables loop filtering across tile boundaries. Non-uniform tile dimensions,
+multiple slices per tile or picture, and an explicit request to enable
+cross-tile filtering with multiple tiles or MCTS are rejected. SVT MCTS tile
+extraction and merging have not yet been verified by the x265 integration tests.
+
+Most x265 CLI options not present in the table have no effect when SVT-HEVC
+is enabled and are logged at info level. With SVT-HEVC, the accepted input
+ranges follow SVT-HEVC's specifications, which are mentioned in the Range
 section in the above table. Options starting with prefix "--svt-" are newly added to 
 fecilitate access to the features of SVT-HEVC which couldn't be mapped to the existing x265 CLI's. 
 So these options will have effect only if SVT-HEVC is enabled and would be ignored with default x265 encode.

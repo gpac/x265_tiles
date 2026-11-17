@@ -289,12 +289,13 @@ public:
     uint8_t  getCbf(uint32_t absPartIdx, TextType ttype, uint32_t tuDepth) const { return (m_cbf[ttype][absPartIdx] >> tuDepth) & 0x1; }
     bool     getQtRootCbf(uint32_t absPartIdx) const                             { return (m_cbf[0][absPartIdx] || ((m_chromaFormat != X265_CSP_I400) && (m_cbf[1][absPartIdx] || m_cbf[2][absPartIdx]))); }
     int8_t   getRefQP(uint32_t currAbsIdxInCTU) const;
-    uint32_t getInterMergeCandidates(uint32_t absPartIdx, uint32_t puIdx, MVField (*candMvField)[2], uint8_t* candDir) const;
+    uint32_t getInterMergeCandidates(uint32_t absPartIdx, uint32_t puIdx, MVField (*candMvField)[2], uint8_t* candDir, uint32_t* spatialCount = NULL) const;
+    bool     restrictMctsTemporalMvp() const;
     void     clipMv(MV& outMV) const;
 #if (ENABLE_MULTIVIEW || ENABLE_SCC_EXT)
-    int      getPMV(InterNeighbourMV* neighbours, uint32_t reference_list, uint32_t refIdx, MV* amvpCand, MV* pmv, uint32_t puIdx = 0, uint32_t absPartIdx = 0) const;
+    int      getPMV(InterNeighbourMV* neighbours, uint32_t reference_list, uint32_t refIdx, MV* amvpCand, MV* pmv, uint32_t puIdx = 0, uint32_t absPartIdx = 0, int* safeMvpIdx = NULL) const;
 #else
-    int      getPMV(InterNeighbourMV* neighbours, uint32_t reference_list, uint32_t refIdx, MV* amvpCand, MV* pmv) const;
+    int      getPMV(InterNeighbourMV* neighbours, uint32_t reference_list, uint32_t refIdx, MV* amvpCand, MV* pmv, int* safeMvpIdx = NULL) const;
 #endif
     void     getNeighbourMV(uint32_t puIdx, uint32_t absPartIdx, InterNeighbourMV* neighbours) const;
     void     getIntraTUQtDepthRange(uint32_t tuDepthRange[2], uint32_t absPartIdx) const;

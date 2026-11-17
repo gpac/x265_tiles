@@ -298,7 +298,12 @@ void FrameFilter::ParallelFilter::copySaoAboveRef(const CUData *ctu, PicYuv* rec
 {
     // Copy SAO Top Reference Pixels
     int ctuWidth  = ctu->m_encData->m_param->maxCUSize;
-    const pixel* recY = reconPic->getPlaneAddr(0, cuAddr) - (ctu->m_bFirstRowInSlice ? 0 : reconPic->m_stride);
+    TileLayout tiles(*ctu->m_slice->m_sps, *ctu->m_slice->m_pps);
+    uint32_t row = cuAddr / tiles.width;
+    bool acrossTiles = ctu->m_slice->m_pps->bLoopFilterAcrossTiles && !ctu->m_slice->m_param->bTileSlices;
+    bool firstRow = !row || ctu->m_bFirstRowInSlice ||
+                    (!acrossTiles && tiles.id(col, row) != tiles.id(col, row - 1));
+    const pixel* recY = reconPic->getPlaneAddr(0, cuAddr) - (firstRow ? 0 : reconPic->m_stride);
 
     // Luma
     memcpy(&m_sao.m_tmpU[0][col * ctuWidth], recY, ctuWidth * sizeof(pixel));
@@ -309,8 +314,8 @@ void FrameFilter::ParallelFilter::copySaoAboveRef(const CUData *ctu, PicYuv* rec
     {
         ctuWidth  >>= m_sao.m_hChromaShift;
 
-        const pixel* recU = reconPic->getPlaneAddr(1, cuAddr) - (ctu->m_bFirstRowInSlice ? 0 : reconPic->m_strideC);
-        const pixel* recV = reconPic->getPlaneAddr(2, cuAddr) - (ctu->m_bFirstRowInSlice ? 0 : reconPic->m_strideC);
+        const pixel* recU = reconPic->getPlaneAddr(1, cuAddr) - (firstRow ? 0 : reconPic->m_strideC);
+        const pixel* recV = reconPic->getPlaneAddr(2, cuAddr) - (firstRow ? 0 : reconPic->m_strideC);
         memcpy(&m_sao.m_tmpU[1][col * ctuWidth], recU, ctuWidth * sizeof(pixel));
         memcpy(&m_sao.m_tmpU[2][col * ctuWidth], recV, ctuWidth * sizeof(pixel));
 

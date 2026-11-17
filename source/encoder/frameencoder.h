@@ -259,6 +259,9 @@ public:
     Bitstream*               m_outStreams;
     Bitstream*               m_backupStreams;
     uint32_t*                m_substreamSizes;
+    Entropy*                 m_tileCoders;
+    Entropy*                 m_tileContexts;
+    Entropy*                 m_backupTileCoders;
 
     CUGeom*                  m_cuGeoms;
     uint32_t*                m_ctuGeomMap;
@@ -314,6 +317,7 @@ protected:
     int  collectCTUStatistics(const CUData& ctu, FrameStats* frameLog);
     void noiseReductionUpdate();
     void writeTrailingSEIMessages(int layer);
+    void writeRpu(int layer);
     bool writeToneMapInfo(x265_sei_payload *payload);
 
     /* Called by WaveFront::findJob() */

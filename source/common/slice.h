@@ -310,6 +310,13 @@ struct SPS
 struct PPS
 {
     uint32_t maxCuDQPDepth;
+    uint32_t tileColumns;
+    uint32_t tileRows;
+    uint32_t slicesPerTile;
+    uint32_t tileColumnBoundary[21];
+    uint32_t tileRowBoundary[23];
+    bool     bUniformTileSpacing;
+    bool     bLoopFilterAcrossTiles;
 
     int      chromaQpOffset[2];      // use param
     int      deblockingFilterBetaOffsetDiv2;
@@ -335,6 +342,65 @@ struct PPS
     int      maxViews;
 
     int      profileIdc;
+};
+
+struct TileLayout
+{
+    uint32_t width, height, columns, rows;
+    const PPS& pps;
+
+    TileLayout(const SPS& sps, const PPS& pps)
+        : width(sps.numCuInWidth), height(sps.numCuInHeight)
+        , columns(pps.tileColumns), rows(pps.tileRows), pps(pps) {}
+
+    uint32_t columnStart(uint32_t x) const { return pps.tileColumnBoundary[x]; }
+    uint32_t rowStart(uint32_t y) const { return pps.tileRowBoundary[y]; }
+    uint32_t column(uint32_t x) const
+    {
+        uint32_t i = 0;
+        while (i + 1 < columns && x >= columnStart(i + 1))
+            i++;
+        return i;
+    }
+    uint32_t row(uint32_t y) const
+    {
+        uint32_t i = 0;
+        while (i + 1 < rows && y >= rowStart(i + 1))
+            i++;
+        return i;
+    }
+    uint32_t id(uint32_t x, uint32_t y) const { return row(y) * columns + column(x); }
+    uint32_t sliceBand(uint32_t y) const
+    {
+        uint32_t tileRow = row(y);
+        uint32_t first = rowStart(tileRow);
+        uint32_t heightInCtus = rowStart(tileRow + 1) - first;
+        return ((y - first + 1) * pps.slicesPerTile - 1) / heightInCtus;
+    }
+    uint32_t sliceRowStart(uint32_t tileRow, uint32_t band) const
+    {
+        return rowStart(tileRow) + band * (rowStart(tileRow + 1) - rowStart(tileRow)) / pps.slicesPerTile;
+    }
+    uint32_t sliceId(uint32_t x, uint32_t y) const
+    {
+        return id(x, y) * pps.slicesPerTile + sliceBand(y);
+    }
+    uint32_t wavefrontStream(uint32_t x, uint32_t y) const
+    {
+        uint32_t tileRow = row(y);
+        uint32_t first = rowStart(tileRow);
+        return first * columns + column(x) * (rowStart(tileRow + 1) - first) + y - first;
+    }
+    bool isLastInSlice(uint32_t x, uint32_t y) const
+    {
+        return x + 1 == columnStart(column(x) + 1) &&
+               y + 1 == sliceRowStart(row(y), sliceBand(y) + 1);
+    }
+    bool isLast(uint32_t x, uint32_t y) const
+    {
+        return x + 1 == columnStart(column(x) + 1) &&
+               y + 1 == rowStart(row(y) + 1);
+    }
 };
 
 struct WeightParam
